@@ -5,7 +5,7 @@
  * Copyright © 2004-2019 Tom St Denis
  * Copyright © 2004 g10 Code GmbH
  * Copyright © 2002-2015 Wei Dai & Igor Pavlov
- * Copyright © 2015-2024 Pete Batard <pete@akeo.ie>
+ * Copyright © 2015-2025 Pete Batard <pete@akeo.ie>
  * Copyright © 2022 Jeffrey Walton <noloader@gmail.com>
  * Copyright © 2016 Alexander Graf
  *
@@ -70,9 +70,11 @@
 #include <windowsx.h>
 
 #include "db.h"
+#include "efi.h"
 #include "rufus.h"
 #include "winio.h"
 #include "missing.h"
+#include "darkmode.h"
 #include "resource.h"
 #include "msapi_utf8.h"
 #include "localization.h"
@@ -113,7 +115,7 @@ StrArray modified_files = { 0 };
 
 extern int default_thread_priority;
 extern const char* efi_archname[ARCH_MAX];
-extern char* sbat_level_txt;
+extern char *sbat_level_txt, *sb_active_txt, *sb_revoked_txt;
 extern BOOL expert_mode, usb_debug;
 
 /*
@@ -1696,7 +1698,7 @@ BOOL efi_image_parse(uint8_t* efi, size_t len, struct efi_image_regions** regp)
 	if (len < 0x80)
 		return FALSE;
 	dos = (void*)efi;
-	if (dos->e_lfanew > len - 0x40)
+	if (dos->e_lfanew > (LONG)len - 0x40)
 		return FALSE;
 	nt = (void*)(efi + dos->e_lfanew);
 	authsz = 0;
@@ -1886,19 +1888,22 @@ out:
  */
 INT_PTR CALLBACK HashCallback(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 {
+	static HFONT hFont = NULL;
 	int i, dw, dh;
 	RECT rc;
-	HFONT hFont;
 	HDC hDC;
 
 	switch (message) {
 	case WM_INITDIALOG:
+		SetDarkModeForDlg(hDlg);
 		apply_localization(IDD_HASH, hDlg);
-		hDC = GetDC(hDlg);
-		hFont = CreateFontA(-MulDiv(9, GetDeviceCaps(hDC, LOGPIXELSY), 72),
-			0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-			0, 0, PROOF_QUALITY, 0, "Courier New");
-		safe_release_dc(hDlg, hDC);
+		if (hFont == NULL) {
+			hDC = GetDC(hDlg);
+			hFont = CreateFontA(-MulDiv(9, GetDeviceCaps(hDC, LOGPIXELSY), 72),
+				0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+				0, 0, PROOF_QUALITY, 0, "Courier New");
+			safe_release_dc(hDlg, hDC);
+		}
 		SendDlgItemMessageA(hDlg, IDC_MD5, WM_SETFONT, (WPARAM)hFont, TRUE);
 		SendDlgItemMessageA(hDlg, IDC_SHA1, WM_SETFONT, (WPARAM)hFont, TRUE);
 		SendDlgItemMessageA(hDlg, IDC_SHA256, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -1938,9 +1943,13 @@ INT_PTR CALLBACK HashCallback(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPa
 			for (i = (int)strlen(image_path); (i > 0) && (image_path[i] != '\\'); i--);
 			SetWindowTextU(hDlg, &image_path[i + 1]);
 		}
+		SetDarkModeForChild(hDlg);
 		// Set focus on the OK button
 		SendMessage(hDlg, WM_NEXTDLGCTL, (WPARAM)GetDlgItem(hDlg, IDOK), TRUE);
 		CenterDialog(hDlg, NULL);
+		break;
+	case WM_NCDESTROY:
+		safe_delete_object(hFont);
 		break;
 	case WM_COMMAND:
 		switch (LOWORD(wParam)) {
@@ -2156,6 +2165,12 @@ static BOOL IsRevokedBySbat(uint8_t* buf, uint32_t len)
 	uint32_t i, j, sbat_len;
 	sbat_entry_t entry;
 
+	// Fall back to embedded sbat_level.txt if we couldn't access remote
+	if (sbat_entries == NULL) {
+		sbat_level_txt = safe_strdup(db_sbat_level_txt);
+		sbat_entries = GetSbatEntries(sbat_level_txt);
+	}
+	assert(sbat_entries != NULL);
 	if (sbat_entries == NULL)
 		return FALSE;
 
@@ -2183,12 +2198,77 @@ static BOOL IsRevokedBySbat(uint8_t* buf, uint32_t len)
 		if (entry.version == 0)
 			continue;
 		for (j = 0; sbat_entries[j].product != NULL; j++) {
-			if (strcmp(entry.product, sbat_entries[j].product) == 0 && entry.version < sbat_entries[j].version)
+			if (strcmp(entry.product, sbat_entries[j].product) == 0 && entry.version < sbat_entries[j].version) {
+				uprintf("  SBAT version for '%s' (%d) is lower than the current minimum SBAT version (%d)!",
+					entry.product, entry.version, sbat_entries[j].version);
 				return TRUE;
+			}
 		}
 	}
 
 	return FALSE;
+}
+
+// NB: Can be tested using en_windows_8_1_x64_dvd_2707217.iso
+extern BOOL UseLocalDbx(int arch);
+static BOOL IsRevokedByDbx(uint8_t* hash, uint8_t* buf, uint32_t len)
+{
+	EFI_VARIABLE_AUTHENTICATION_2* efi_var_auth;
+	EFI_SIGNATURE_LIST* efi_sig_list;
+	BYTE* dbx_data = NULL;
+	BOOL ret = FALSE, needs_free = FALSE;
+	DWORD dbx_size = 0;
+	char dbx_name[32], path[MAX_PATH];
+	uint32_t i, fluff_size, nb_entries;
+
+	i = MachineToArch(GetPeArch(buf));
+	if (i == ARCH_UNKNOWN)
+		goto out;
+
+	// Check if a more recent local DBX should be preferred over embedded
+	static_sprintf(dbx_name, "dbx_%s.bin", efi_archname[i]);
+	if (UseLocalDbx(i)) {
+		static_sprintf(path, "%s\\%s\\%s", app_data_dir, FILES_DIR, dbx_name);
+		dbx_size = read_file(path, &dbx_data);
+		needs_free = (dbx_data != NULL);
+		if (needs_free)
+			duprintf("  Using local %s for revocation check", path);
+	}
+	if (dbx_size == 0) {
+		dbx_data = (BYTE*)GetResource(hMainInstance, MAKEINTRESOURCEA(IDR_DBX + i),
+			_RT_RCDATA, dbx_name, &dbx_size, FALSE);
+	}
+	if (dbx_data == NULL || dbx_size <= sizeof(EFI_VARIABLE_AUTHENTICATION_2))
+		goto out;
+
+	efi_var_auth = (EFI_VARIABLE_AUTHENTICATION_2*)dbx_data;
+	fluff_size = efi_var_auth->AuthInfo.Hdr.dwLength + sizeof(EFI_TIME);
+	if (dbx_size <= fluff_size)
+		goto out;
+	efi_sig_list = (EFI_SIGNATURE_LIST*)&dbx_data[fluff_size];
+	fluff_size += sizeof(EFI_SIGNATURE_LIST);
+	if (dbx_size <= fluff_size)
+		goto out;
+	// Expect SHA-256 hashes
+	if (!CompareGUID(&efi_sig_list->SignatureType, &EFI_CERT_SHA256_GUID)) {
+		uprintf("  Warning: %s is not using SHA-256 hashes - Cannot check for UEFI revocation!", dbx_name);
+		goto out;
+	}
+	fluff_size += efi_sig_list->SignatureHeaderSize;
+	assert(efi_sig_list->SignatureSize != 0);
+	nb_entries = (efi_sig_list->SignatureListSize - efi_sig_list->SignatureHeaderSize - sizeof(EFI_SIGNATURE_LIST)) / efi_sig_list->SignatureSize;
+	assert(dbx_size >= fluff_size + nb_entries * efi_sig_list->SignatureSize);
+
+	fluff_size += sizeof(GUID);
+	for (i = 0; i < nb_entries && !ret; i++) {
+		if (memcmp(hash, &dbx_data[fluff_size + i * efi_sig_list->SignatureSize], SHA256_HASHSIZE) == 0)
+			ret = TRUE;
+	}
+
+out:
+	if (needs_free)
+		free(dbx_data);
+	return ret;
 }
 
 static BOOL IsRevokedBySvn(uint8_t* buf, uint32_t len)
@@ -2229,11 +2309,14 @@ static BOOL IsRevokedBySvn(uint8_t* buf, uint32_t len)
 				svn_ver = (uint32_t*)RvaToPhysical(buf, rsrc_rva);
 				if (svn_ver != NULL) {
 					uuprintf("  SVN version: %d.%d", *svn_ver >> 16, *svn_ver & 0xffff);
-					if (*svn_ver < sbat_entries[i].version)
+					if (*svn_ver < sbat_entries[i].version) {
+						uprintf("  SVN version %d.%d is lower than required minimum SVN version %d.%d!",
+							*svn_ver >> 16, *svn_ver & 0xffff, sbat_entries[i].version >> 16, sbat_entries[i].version & 0xffff);
 						return TRUE;
+					}
 				}
 			} else {
-				uprintf("WARNING: Unexpected Secure Version Number size");
+				uprintf("  Warning: Unexpected Secure Version Number size");
 			}
 		}
 	}
@@ -2242,13 +2325,24 @@ static BOOL IsRevokedBySvn(uint8_t* buf, uint32_t len)
 
 static BOOL IsRevokedByCert(cert_info_t* info)
 {
-	int i;
+	uint32_t i;
 
-	for (i = 0; i < ARRAYSIZE(certdbx); i += SHA1_HASHSIZE) {
-		if (!expert_mode)
-			continue;
-		if (memcmp(info->thumbprint, &certdbx[i], SHA1_HASHSIZE) == 0) {
-			uprintf("Found '%s' revoked certificate", info->name);
+	// TODO: Enable this for non expert mode after enforcement of PCA2011 cert revocation
+	if (!expert_mode)
+		return FALSE;
+
+	// Fall back to embedded Secure Boot thumbprints if we couldn't access remote
+	if (sb_revoked_certs == NULL) {
+		sb_revoked_txt = safe_strdup(db_sb_revoked_txt);
+		sb_revoked_certs = GetThumbprintEntries(sb_revoked_txt);
+	}
+	assert(sb_revoked_certs != NULL && sb_revoked_certs->count != 0);
+	if (sb_revoked_certs == NULL)
+		return FALSE;
+
+	for (i = 0; i < sb_revoked_certs->count; i++) {
+		if (memcmp(info->thumbprint, sb_revoked_certs->list[i], SHA1_HASHSIZE) == 0) {
+			uuprintf("  Found '%s' revoked certificate", info->name);
 			return TRUE;
 		}
 	}
@@ -2257,7 +2351,7 @@ static BOOL IsRevokedByCert(cert_info_t* info)
 
 BOOL IsSignedBySecureBootAuthority(uint8_t* buf, uint32_t len)
 {
-	int i;
+	uint32_t i;
 	uint8_t* cert;
 	cert_info_t info;
 
@@ -2269,8 +2363,19 @@ BOOL IsSignedBySecureBootAuthority(uint8_t* buf, uint32_t len)
 	// Secure Boot Authority is always an issuer
 	if (GetIssuerCertificateInfo(cert, &info) != 2)
 		return FALSE;
-	for (i = 0; i < ARRAYSIZE(certauth); i += SHA1_HASHSIZE) {
-		if (memcmp(info.thumbprint, &certauth[i], SHA1_HASHSIZE) == 0)
+
+	// Fall back to embedded Secure Boot thumbprints if we couldn't access remote
+	if (sb_active_certs == NULL) {
+		sb_active_txt = safe_strdup(db_sb_active_txt);
+		sb_active_certs = GetThumbprintEntries(sb_active_txt);
+	}
+	// If we still manage to get an empty list at this stage, I sure wanna know about it!
+	assert(sb_active_certs != NULL && sb_active_certs->count != 0);
+	if (sb_active_certs == NULL || sb_active_certs->count == 0)
+		return FALSE;
+
+	for (i = 0; i < sb_active_certs->count; i++) {
+		if (memcmp(info.thumbprint, sb_active_certs->list[i], SHA1_HASHSIZE) == 0)
 			return TRUE;
 	}
 	return FALSE;
@@ -2284,13 +2389,7 @@ int IsBootloaderRevoked(uint8_t* buf, uint32_t len)
 	IMAGE_NT_HEADERS32* pe_header;
 	uint8_t* cert;
 	cert_info_t info;
-	int r;
-
-	// Fall back to embedded sbat_level.txt if we couldn't access remote
-	if (sbat_entries == NULL) {
-		sbat_level_txt = safe_strdup(db_sbat_level_txt);
-		sbat_entries = GetSbatEntries(sbat_level_txt);
-	}
+	int r, revoked = 0;
 
 	if (buf == NULL || len < 0x100 || dos_header->e_magic != IMAGE_DOS_SIGNATURE)
 		return -2;
@@ -2301,38 +2400,47 @@ int IsBootloaderRevoked(uint8_t* buf, uint32_t len)
 	// Get the signer/issuer info
 	cert = GetPeSignatureData(buf);
 	r = GetIssuerCertificateInfo(cert, &info);
-	if (r == 0)
-		uuprintf("  (Unsigned Bootloader)");
-	else if (r > 0)
-		uuprintf("  Signed by: %s", info.name);
+	if (r == 0) {
+		uprintf("  (Unsigned Bootloader)");
+	} else if (r > 0) {
+		uprintf("  Signed by '%s'", info.name);
+		// Only perform revocation checks on signed bootloaders
+		if (!PE256Buffer(buf, len, hash))
+			return -1;
+		// Check for UEFI DBX revocation
+		if (IsRevokedByDbx(hash, buf, len))
+			revoked = 1;
+		// Check for Microsoft SSP revocation
+		for (i = 0; revoked == 0 && i < pe256ssp_size * SHA256_HASHSIZE; i += SHA256_HASHSIZE)
+			if (memcmp(hash, &pe256ssp[i], SHA256_HASHSIZE) == 0)
+				revoked = 2;
+		// Check for Linux SBAT revocation
+		if (revoked == 0 && IsRevokedBySbat(buf, len))
+			revoked = 3;
+		// Check for Microsoft SVN revocation
+		if (revoked == 0 && IsRevokedBySvn(buf, len))
+			revoked = 4;
+		// Check for UEFI DBX certificate revocation
+		if (revoked == 0 && IsRevokedByCert(&info))
+			revoked = 5;
 
-	if (!PE256Buffer(buf, len, hash))
-		return -1;
-	// Check for UEFI DBX revocation
-	for (i = 0; i < ARRAYSIZE(pe256dbx); i += SHA256_HASHSIZE)
-		if (memcmp(hash, &pe256dbx[i], SHA256_HASHSIZE) == 0)
-			return 1;
-	// Check for Microsoft SSP revocation
-	for (i = 0; i < pe256ssp_size * SHA256_HASHSIZE; i += SHA256_HASHSIZE)
-		if (memcmp(hash, &pe256ssp[i], SHA256_HASHSIZE) == 0)
-			return 2;
-	// Check for Linux SBAT revocation
-	if (IsRevokedBySbat(buf, len))
-		return 3;
-	// Check for Microsoft SVN revocation
-	if (IsRevokedBySvn(buf, len))
-		return 4;
-	// Check for UEFI DBX certificate revocation
-	if (IsRevokedByCert(&info))
-		return 5;
-	return 0;
-}
+		// If signed and not revoked, print the various Secure Boot "gotchas"
+		if (revoked == 0) {
+			if (strcmp(info.name, "Microsoft Windows Production PCA 2011") == 0) {
+				uprintf("  Note: This bootloader may fail Secure Boot validation on systems that");
+				uprintf("  have been updated to use the 'Windows UEFI CA 2023' certificate.");
+			} else if (strcmp(info.name, "Windows UEFI CA 2023") == 0) {
+				uprintf("  Note: This bootloader will fail Secure Boot validation on systems that");
+				uprintf("  have not been updated to use the latest Secure Boot certificates");
+			} else if (strcmp(info.name, "Microsoft Corporation UEFI CA 2011") == 0 ||
+				strcmp(info.name, "Microsoft UEFI CA 2023") == 0) {
+				uprintf("  Note: This bootloader may fail Secure Boot validation on *some* systems,");
+				uprintf("  unless you enable \"Microsoft 3rd-party UEFI CA\" in your 'BIOS'.");
+			}
+		}
+	}
 
-void PrintRevokedBootloaderInfo(void)
-{
-	uprintf("Found %d revoked UEFI bootloaders from embedded list", sizeof(pe256dbx) / SHA256_HASHSIZE);
-	if (ParseSKUSiPolicy() && pe256ssp_size != 0)
-		uprintf("Found %d additional revoked UEFI bootloaders from this system's SKUSiPolicy.p7b", pe256ssp_size);
+	return revoked;
 }
 
 /*

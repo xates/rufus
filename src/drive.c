@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Drive access function calls
- * Copyright © 2011-2024 Pete Batard <pete@akeo.ie>
+ * Copyright © 2011-2025 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -33,6 +33,7 @@
 #endif
 
 #include "rufus.h"
+#include "ntdll.h"
 #include "missing.h"
 #include "resource.h"
 #include "settings.h"
@@ -66,7 +67,9 @@ const IID IID_IVdsVolume = { 0x88306BB2, 0xE71F, 0x478C, { 0x86, 0xA2, 0x79, 0xD
 const IID IID_IVdsVolumeMF3 = { 0x6788FAF9, 0x214E, 0x4B85, { 0xBA, 0x59, 0x26, 0x69, 0x53, 0x61, 0x6E, 0x09 } };
 #endif
 
-PF_TYPE_DECL(NTAPI, NTSTATUS, NtQueryVolumeInformationFile, (HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FS_INFORMATION_CLASS));
+#ifndef PERSISTENT_VOLUME_STATE_DEV_VOLUME
+#define PERSISTENT_VOLUME_STATE_DEV_VOLUME (0x00002000)
+#endif
 
 /*
  * Globals
@@ -167,7 +170,7 @@ static HANDLE GetHandle(char* Path, BOOL bLockDrive, BOOL bWriteAccess, BOOL bWr
 			uprintf("Waiting for access on %s...", Path);
 		} else if (!bWriteShare && (i > DRIVE_ACCESS_RETRIES/3)) {
 			// If we can't seem to get a hold of the drive for some time, try to enable FILE_SHARE_WRITE...
-			uprintf("Warning: Could not obtain exclusive rights. Retrying with write sharing enabled...");
+			uprintf("WARNING: Could not obtain exclusive rights. Retrying with write sharing enabled...");
 			bWriteShare = TRUE;
 			// Try to report the process that is locking the drive
 			access_mask = GetProcessSearch(SEARCH_PROCESS_TIMEOUT, 0x07, FALSE);
@@ -280,11 +283,11 @@ char* GetLogicalName(DWORD DriveIndex, uint64_t PartitionOffset, BOOL bKeepTrail
 
 		// Sanity checks
 		len = safe_strlen(volume_name);
-		if_not_assert(len > 4)
+		if_assert_fails(len > 4)
 			continue;
-		if_not_assert(safe_strnicmp(volume_name, volume_start, 4) == 0)
+		if_assert_fails(safe_strnicmp(volume_name, volume_start, 4) == 0)
 			continue;
-		if_not_assert(volume_name[len - 1] == '\\')
+		if_assert_fails(volume_name[len - 1] == '\\')
 			continue;
 
 		drive_type = GetDriveTypeA(volume_name);
@@ -363,7 +366,7 @@ char* GetLogicalName(DWORD DriveIndex, uint64_t PartitionOffset, BOOL bKeepTrail
 		// NB: We need to re-add DRIVE_INDEX_MIN for this call since CheckDriveIndex() subtracted it
 		ret = AltGetLogicalName(DriveIndex + DRIVE_INDEX_MIN, PartitionOffset, bKeepTrailingBackslash, bSilent);
 		if ((ret != NULL) && (strchr(ret, ' ') != NULL))
-			uprintf("Warning: Using physical device to access partition data");
+			uprintf("WARNING: Using physical device to access partition data");
 	}
 
 out:
@@ -669,6 +672,7 @@ static BOOL GetVdsDiskInterface(DWORD DriveIndex, const IID* InterfaceIID, void*
 
 			// List disks
 			while (IEnumVdsObject_Next(pEnumDisk, 1, &pDiskUnk, &ulFetched) == S_OK) {
+				BOOL r;
 				VDS_DISK_PROP prop;
 				IVdsDisk* pDisk;
 
@@ -687,13 +691,13 @@ static BOOL GetVdsDiskInterface(DWORD DriveIndex, const IID* InterfaceIID, void*
 					suprintf("Could not query VDS Disk Properties: %s", VdsErrorString(hr));
 					break;
 				}
+				hr = S_OK;
 
-				// Check if we are on the target disk
-				// uprintf("GetVdsDiskInterface: Seeking %S found %S", wPhysicalName, prop.pwszName);
-				hr = (HRESULT)_wcsicmp(wPhysicalName, prop.pwszName);
-				CoTaskMemFree(prop.pwszName);
-				if (hr != S_OK) {
-					hr = S_OK;
+				// Check if we are on the target disk. Note that prop.pwszName can be NULL on failed disks.
+				r = (prop.pwszName != NULL) && (_wcsicmp(wPhysicalName, prop.pwszName) == 0);
+				CoTaskMemFree(prop.pwszName);	// NB: Per MS docs, CoTaskMemFree() accepts NULL.
+				if (!r) {
+					IVdsDisk_Release(pDisk);
 					continue;
 				}
 
@@ -1097,14 +1101,12 @@ static BOOL _GetDriveLettersAndType(DWORD DriveIndex, char* drive_letters, UINT*
 	HANDLE hDrive = INVALID_HANDLE_VALUE, hPhysical = INVALID_HANDLE_VALUE;
 	UINT _drive_type;
 	IO_STATUS_BLOCK io_status_block;
-	FILE_FS_DEVICE_INFORMATION file_fs_device_info;
+	FILE_FS_DEVICE_INFORMATION file_fs_device_info = { 0 };
 	BYTE geometry[256] = { 0 };
 	PDISK_GEOMETRY_EX DiskGeometry = (PDISK_GEOMETRY_EX)(void*)geometry;
 	int i = 0, drives_found = 0, drive_number;
 	char *drive, drives[26*4 + 1];	/* "D:\", "E:\", etc., plus one NUL */
 	char logical_drive[] = "\\\\.\\#:";
-
-	PF_INIT(NtQueryVolumeInformationFile, Ntdll);
 
 	if (drive_letters != NULL)
 		drive_letters[0] = 0;
@@ -1151,13 +1153,12 @@ static BOOL _GetDriveLettersAndType(DWORD DriveIndex, char* drive_letters, UINT*
 				NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL, 3000);
 		if (hDrive == INVALID_HANDLE_VALUE) {
 			if (GetLastError() == WAIT_TIMEOUT)
-				uprintf("Warning: Time-out while trying to query drive %c", toupper(drive[0]));
+				uprintf("WARNING: Time-out while trying to query drive %c", toupper(drive[0]));
 			continue;
 		}
 
 		// Eliminate floppy drives
-		if ((pfNtQueryVolumeInformationFile != NULL) &&
-			(pfNtQueryVolumeInformationFile(hDrive, &io_status_block, &file_fs_device_info,
+		if ((NtQueryVolumeInformationFile(hDrive, &io_status_block, &file_fs_device_info,
 				sizeof(file_fs_device_info), FileFsDeviceInformation) == NO_ERROR) &&
 			(file_fs_device_info.Characteristics & FILE_FLOPPY_DISKETTE) ) {
 				continue;
@@ -1887,7 +1888,7 @@ BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSys
 	SelectedDrive.SectorSize = DiskGeometry->Geometry.BytesPerSector;
 	SelectedDrive.FirstDataSector = MAXDWORD;
 	if (SelectedDrive.SectorSize < 512) {
-		suprintf("Warning: Drive 0x%02x reports a sector size of %d - Correcting to 512 bytes.",
+		suprintf("WARNING: Drive 0x%02x reports a sector size of %d - Correcting to 512 bytes.",
 			DriveIndex, SelectedDrive.SectorSize);
 		SelectedDrive.SectorSize = 512;
 	}
@@ -1896,9 +1897,9 @@ BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSys
 
 	suprintf("Disk type: %s, Disk size: %s, Sector size: %d bytes",
 		(SelectedDrive.MediaType == FixedMedia) ? "FIXED" : "Removable",
-		SizeToHumanReadable(SelectedDrive.DiskSize, FALSE, TRUE), SelectedDrive.SectorSize);
+		SizeToHumanReadable(SelectedDrive.DiskSize, FALSE, FALSE), SelectedDrive.SectorSize);
 	suprintf("Cylinders: %" PRIi64 ", Tracks per cylinder: %d, Sectors per track: %d",
-		DiskGeometry->Geometry.Cylinders, DiskGeometry->Geometry.TracksPerCylinder, DiskGeometry->Geometry.SectorsPerTrack);
+		DiskGeometry->Geometry.Cylinders.QuadPart, DiskGeometry->Geometry.TracksPerCylinder, DiskGeometry->Geometry.SectorsPerTrack);
 	assert(SelectedDrive.SectorSize != 0);
 
 	r = DeviceIoControl(hPhysical, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, NULL, 0, layout, sizeof(layout), &size, NULL );
@@ -2001,7 +2002,7 @@ BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSys
 			suprintf("  ID: %s\r\n  Size: %s (%" PRIi64 " bytes)\r\n  Start Sector: %" PRIi64 ", Attributes: 0x%016" PRIX64,
 				GuidToString(&DriveLayout->PartitionEntry[i].Gpt.PartitionId, TRUE),
 				SizeToHumanReadable(DriveLayout->PartitionEntry[i].PartitionLength.QuadPart, TRUE, FALSE),
-				DriveLayout->PartitionEntry[i].PartitionLength,
+				DriveLayout->PartitionEntry[i].PartitionLength.QuadPart,
 				DriveLayout->PartitionEntry[i].StartingOffset.QuadPart / SelectedDrive.SectorSize,
 				DriveLayout->PartitionEntry[i].Gpt.Attributes);
 			SelectedDrive.FirstDataSector = min(SelectedDrive.FirstDataSector,
@@ -2130,7 +2131,7 @@ BOOL MountVolume(char* drive_name, char *volume_name)
 			}
 			uprintf("Retrying after dismount...");
 			if (!DeleteVolumeMountPointA(drive_name))
-				uprintf("Warning: Could not delete volume mountpoint '%s': %s", drive_name, WindowsErrorString());
+				uprintf("WARNING: Could not delete volume mountpoint '%s': %s", drive_name, WindowsErrorString());
 			if (SetVolumeMountPointA(drive_name, volume_name))
 				return TRUE;
 			if ((GetLastError() == ERROR_DIR_NOT_EMPTY) &&
@@ -2303,7 +2304,7 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 		// CHS sizes that IBM imparted upon us. Long story short, we now align to a
 		// cylinder size that is itself aligned to the cluster size.
 		// If this actually breaks old systems, please send your complaints to IBM.
-		SelectedDrive.Partition[pi].Offset = HI_ALIGN_X_TO_Y(bytes_per_track, ClusterSize);
+		SelectedDrive.Partition[pi].Offset = CEILING_ALIGN(bytes_per_track, ClusterSize);
 		// GRUB2 no longer fits in the usual 31½ KB that the above computation provides
 		// so just unconditionally double that size and get on with it.
 		SelectedDrive.Partition[pi].Offset *= 2;
@@ -2320,9 +2321,9 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 		SelectedDrive.Partition[pi].Size = esp_size;
 		SelectedDrive.Partition[pi + 1].Offset = SelectedDrive.Partition[pi].Offset + SelectedDrive.Partition[pi].Size;
 		// Align next partition to track and cluster
-		SelectedDrive.Partition[pi + 1].Offset = HI_ALIGN_X_TO_Y(SelectedDrive.Partition[pi + 1].Offset, bytes_per_track);
+		SelectedDrive.Partition[pi + 1].Offset = CEILING_ALIGN(SelectedDrive.Partition[pi + 1].Offset, bytes_per_track);
 		if (ClusterSize % SelectedDrive.SectorSize == 0)
-			SelectedDrive.Partition[pi + 1].Offset = LO_ALIGN_X_TO_Y(SelectedDrive.Partition[pi + 1].Offset, ClusterSize);
+			SelectedDrive.Partition[pi + 1].Offset = FLOOR_ALIGN(SelectedDrive.Partition[pi + 1].Offset, ClusterSize);
 		assert(SelectedDrive.Partition[pi + 1].Offset >= SelectedDrive.Partition[pi].Offset + SelectedDrive.Partition[pi].Size);
 		pi++;
 		// Clear the extra partition we processed
@@ -2335,9 +2336,9 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 		wcscpy(SelectedDrive.Partition[pi].Name, L"Microsoft Reserved Partition");
 		SelectedDrive.Partition[pi].Size = 128 * MB;
 		SelectedDrive.Partition[pi + 1].Offset = SelectedDrive.Partition[pi].Offset + SelectedDrive.Partition[pi].Size;
-		SelectedDrive.Partition[pi + 1].Offset = HI_ALIGN_X_TO_Y(SelectedDrive.Partition[pi + 1].Offset, bytes_per_track);
+		SelectedDrive.Partition[pi + 1].Offset = CEILING_ALIGN(SelectedDrive.Partition[pi + 1].Offset, bytes_per_track);
 		if (ClusterSize % SelectedDrive.SectorSize == 0)
-			SelectedDrive.Partition[pi + 1].Offset = LO_ALIGN_X_TO_Y(SelectedDrive.Partition[pi + 1].Offset, ClusterSize);
+			SelectedDrive.Partition[pi + 1].Offset = FLOOR_ALIGN(SelectedDrive.Partition[pi + 1].Offset, ClusterSize);
 		assert(SelectedDrive.Partition[pi + 1].Offset >= SelectedDrive.Partition[pi].Offset + SelectedDrive.Partition[pi].Size);
 		pi++;
 		extra_partitions &= ~(XP_MSR);
@@ -2356,16 +2357,16 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 			assert(persistence_size != 0);
 			partition_index[PI_CASPER] = pi;
 			wcscpy(SelectedDrive.Partition[pi].Name, L"Linux Persistence");
-			SelectedDrive.Partition[pi++].Size = HI_ALIGN_X_TO_Y(persistence_size, bytes_per_track);
+			SelectedDrive.Partition[pi++].Size = CEILING_ALIGN(persistence_size, bytes_per_track);
 		}
 		if (extra_partitions & XP_ESP) {
 			partition_index[PI_ESP] = pi;
 			wcscpy(SelectedDrive.Partition[pi].Name, L"EFI System Partition");
-			SelectedDrive.Partition[pi++].Size = HI_ALIGN_X_TO_Y(esp_size, bytes_per_track);
+			SelectedDrive.Partition[pi++].Size = CEILING_ALIGN(esp_size, bytes_per_track);
 		} else if (extra_partitions & XP_UEFI_NTFS) {
 			partition_index[PI_UEFI_NTFS] = pi;
 			wcscpy(SelectedDrive.Partition[pi].Name, L"UEFI:NTFS");
-			SelectedDrive.Partition[pi++].Size = HI_ALIGN_X_TO_Y(uefi_ntfs_size, bytes_per_track);
+			SelectedDrive.Partition[pi++].Size = CEILING_ALIGN(uefi_ntfs_size, bytes_per_track);
 		} else if (extra_partitions & XP_COMPAT) {
 			wcscpy(SelectedDrive.Partition[pi].Name, L"BIOS Compatibility");
 			SelectedDrive.Partition[pi++].Size = bytes_per_track;	// One track for the extra partition
@@ -2381,13 +2382,13 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 		last_offset -= 33ULL * SelectedDrive.SectorSize;
 	for (i = pi - 1; i > mi; i--) {
 		assert(SelectedDrive.Partition[i].Size < last_offset);
-		SelectedDrive.Partition[i].Offset = LO_ALIGN_X_TO_Y(last_offset - SelectedDrive.Partition[i].Size, bytes_per_track);
+		SelectedDrive.Partition[i].Offset = FLOOR_ALIGN(last_offset - SelectedDrive.Partition[i].Size, bytes_per_track);
 		last_offset = SelectedDrive.Partition[i].Offset;
 	}
 
 	// With the above, Compute the main partition size (which we align to a track)
 	assert(last_offset > SelectedDrive.Partition[mi].Offset);
-	SelectedDrive.Partition[mi].Size = LO_ALIGN_X_TO_Y(last_offset - SelectedDrive.Partition[mi].Offset, bytes_per_track);
+	SelectedDrive.Partition[mi].Size = FLOOR_ALIGN(last_offset - SelectedDrive.Partition[mi].Offset, bytes_per_track);
 	// Try to make sure that the main partition size is a multiple of the cluster size
 	// This can be especially important when trying to capture an NTFS partition as FFU, as, when
 	// the NTFS partition is aligned to cluster size, the FFU capture parses the NTFS allocated
@@ -2395,7 +2396,7 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 	// a full sector by sector scan of the NTFS partition and records any non-zero garbage, which
 	// may include garbage leftover data from a previous reformat...
 	if (ClusterSize % SelectedDrive.SectorSize == 0)
-		SelectedDrive.Partition[mi].Size = LO_ALIGN_X_TO_Y(SelectedDrive.Partition[mi].Size, ClusterSize);
+		SelectedDrive.Partition[mi].Size = FLOOR_ALIGN(SelectedDrive.Partition[mi].Size, ClusterSize);
 	if (SelectedDrive.Partition[mi].Size <= 0) {
 		uprintf("Error: Invalid %S size", SelectedDrive.Partition[mi].Name);
 		return FALSE;
@@ -2481,7 +2482,7 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 	// We need to write the UEFI:NTFS partition before we refresh the disk
 	if (extra_partitions & XP_UEFI_NTFS) {
 		LARGE_INTEGER li;
-		uprintf("Writing UEFI:NTFS data...", SelectedDrive.Partition[partition_index[PI_UEFI_NTFS]].Name);
+		uprintf("Writing UEFI:NTFS data...");
 		li.QuadPart = SelectedDrive.Partition[partition_index[PI_UEFI_NTFS]].Offset;
 		if (!SetFilePointerEx(hDrive, li, NULL, FILE_BEGIN)) {
 			uprintf("  Could not set position");
@@ -2611,40 +2612,30 @@ const char* GetGPTPartitionType(const GUID* guid)
 }
 
 /*
- * Detect Microsoft Dev Drives, which are VHDs consisting of a small MSR followed by a large
- * (50 GB or more) ReFS partition. See https://learn.microsoft.com/en-us/windows/dev-drive/.
- * NB: Despite the option being proposed, I have *NOT* been able to create MBR-based Dev Drives.
+ * Detect Microsoft Dev Drives. See https://learn.microsoft.com/en-us/windows/dev-drive/.
  */
 BOOL IsMsDevDrive(DWORD DriveIndex)
 {
-	BOOL r, ret = FALSE;
+	BOOL ret = FALSE;
 	DWORD size = 0;
-	HANDLE hPhysical = INVALID_HANDLE_VALUE;
-	BYTE layout[4096] = { 0 };
-	PDRIVE_LAYOUT_INFORMATION_EX DriveLayout = (PDRIVE_LAYOUT_INFORMATION_EX)(void*)layout;
+	HANDLE hLogical = INVALID_HANDLE_VALUE;
+	FILE_FS_PERSISTENT_VOLUME_INFORMATION data = { 0 };
 
-	hPhysical = GetPhysicalHandle(DriveIndex, FALSE, FALSE, TRUE);
-	if (hPhysical == INVALID_HANDLE_VALUE)
-		goto out;
-
-	r = DeviceIoControl(hPhysical, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, NULL, 0, layout, sizeof(layout), &size, NULL);
-	if (!r || size <= 0)
+	hLogical = GetLogicalHandle(DriveIndex, 0, FALSE, FALSE, FALSE);
+	if (hLogical == INVALID_HANDLE_VALUE)
 		goto out;
 
-	if (DriveLayout->PartitionStyle != PARTITION_STYLE_GPT)
+	data.FlagMask = PERSISTENT_VOLUME_STATE_DEV_VOLUME;
+	data.Version = 1;
+
+	if (!DeviceIoControl(hLogical, FSCTL_QUERY_PERSISTENT_VOLUME_STATE, &data, sizeof(data),
+		&data, sizeof(data), &size, NULL))
 		goto out;
-	if (DriveLayout->PartitionCount != 2)
-		goto out;
-	if (!CompareGUID(&DriveLayout->PartitionEntry[0].Gpt.PartitionType, &PARTITION_MICROSOFT_RESERVED))
-		goto out;
-	if (!CompareGUID(&DriveLayout->PartitionEntry[1].Gpt.PartitionType, &PARTITION_MICROSOFT_DATA))
-		goto out;
-	if (DriveLayout->PartitionEntry[1].PartitionLength.QuadPart < 20 * GB)
-		goto out;
-	ret = (strcmp(GetFsName(hPhysical, DriveLayout->PartitionEntry[1].StartingOffset), "ReFS") == 0);
+
+	ret = data.VolumeFlags & PERSISTENT_VOLUME_STATE_DEV_VOLUME;
 
 out:
-	safe_closehandle(hPhysical);
+	safe_closehandle(hLogical);
 	return ret;
 }
 

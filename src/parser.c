@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Elementary Unicode compliant find/replace parser
- * Copyright © 2012-2024 Pete Batard <pete@akeo.ie>
+ * Copyright © 2012-2025 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -55,7 +55,7 @@ static loc_cmd* get_loc_cmd(char c, char* line) {
 	char *endptr, *expected_endptr, *token;
 	loc_cmd* lcmd = NULL;
 
-	for (j=0; j<ARRAYSIZE(parse_cmd); j++) {
+	for (j = 0; j<ARRAYSIZE(parse_cmd); j++) {
 		if (c == parse_cmd[j].c)
 			break;
 	}
@@ -133,10 +133,11 @@ static loc_cmd* get_loc_cmd(char c, char* line) {
 		case 'u':	// comma or dot separated list of unsigned integers (to end of line)
 			// count the number of commas
 			lcmd->unum_size = 1;
-			for (l=i; line[l] != 0; l++) {
+			for (l = i; line[l] != 0; l++) {
 				if ((line[l] == '.') || (line[l] == ','))
 					lcmd->unum_size++;
 			}
+			free(lcmd->unum);
 			lcmd->unum = (uint32_t*)malloc(lcmd->unum_size * sizeof(uint32_t));
 			if (lcmd->unum == NULL) {
 				luprint("could not allocate memory");
@@ -1304,6 +1305,23 @@ char* replace_char(const char* src, const char c, const char* rep)
 }
 
 /*
+ * Replace all characters from string 'str' that are present in the array of chars 'rem'
+ * to the 'rep' character.
+ */
+void filter_chars(char* str, const char* rem, const char rep)
+{
+	char *p, *q;
+
+	if (str == NULL || rem == NULL)
+		return;
+	for (p = str; *p != '\0'; p++) {
+		for (q = (char*)rem; *q != '\0'; q++)
+			if (*p == *q)
+				*p = rep;
+	}
+}
+
+/*
  * Remove all instances of substring 'sub' form string 'src.
  * The returned string is allocated and must be freed by the caller.
  */
@@ -1581,20 +1599,21 @@ sbat_entry_t* GetSbatEntries(char* sbatlevel)
 	BOOL eol, eof;
 	char* version_str;
 	uint32_t i, num_entries;
-	sbat_entry_t* _sbat_entries;
+	sbat_entry_t* sbat_list;
 
 	if (sbatlevel == NULL)
 		return NULL;
 
-	num_entries = 0;
-	for (i = 0; sbatlevel[i] != '\0'; i++)
+	num_entries = 1;
+	for (i = 0; sbatlevel[i] != '\0'; i++) {
 		if (sbatlevel[i] == '\n')
 			num_entries++;
+		if (sbatlevel[i] == '\r')
+			sbatlevel[i] = '\n';
+	}
 
-	if (num_entries == 0)
-		return NULL;
-	_sbat_entries = calloc(num_entries + 2, sizeof(sbat_entry_t));
-	if (_sbat_entries == NULL)
+	sbat_list = calloc(num_entries + 1, sizeof(sbat_entry_t));
+	if (sbat_list == NULL)
 		return NULL;
 
 	num_entries = 0;
@@ -1610,7 +1629,7 @@ sbat_entry_t* GetSbatEntries(char* sbatlevel)
 				i++;
 			continue;
 		}
-		_sbat_entries[num_entries].product = &sbatlevel[i];
+		sbat_list[num_entries].product = &sbatlevel[i];
 		for (; sbatlevel[i] != ',' && sbatlevel[i] != '\0' && sbatlevel[i] != '\n'; i++);
 		if (sbatlevel[i] == '\0' || sbatlevel[i] == '\n')
 			break;
@@ -1624,16 +1643,76 @@ sbat_entry_t* GetSbatEntries(char* sbatlevel)
 			i++;
 		// Allow the provision of an hex version
 		if (version_str[0] == '0' && version_str[1] == 'x')
-			_sbat_entries[num_entries].version = strtoul(version_str, NULL, 16);
+			sbat_list[num_entries].version = strtoul(version_str, NULL, 16);
 		else
-			_sbat_entries[num_entries].version = strtoul(version_str, NULL, 10);
+			sbat_list[num_entries].version = strtoul(version_str, NULL, 10);
 		if (!eol)
 			for (; sbatlevel[i] != '\0' && sbatlevel[i] != '\n'; i++);
-		if (_sbat_entries[num_entries].version != 0)
+		if (sbat_list[num_entries].version != 0)
 			num_entries++;
 	}
+	if (num_entries == 0) {
+		free(sbat_list);
+		return NULL;
+	}
 
-	return _sbat_entries;
+	return sbat_list;
+}
+
+/*
+ * Parse a list of SHA-1 certificate hexascii thumbprints.
+ * List must be freed by the caller.
+ */
+thumbprint_list_t* GetThumbprintEntries(char* thumbprints_txt)
+{
+	uint32_t i, j, num_entries;
+	thumbprint_list_t* thumbprints;
+
+	if (thumbprints_txt == NULL)
+		return NULL;
+
+	num_entries = 1;
+	for (i = 0; thumbprints_txt[i] != '\0'; i++)
+		if (thumbprints_txt[i] == '\n')
+			num_entries++;
+
+	thumbprints = calloc(sizeof(thumbprint_list_t) + num_entries * SHA1_HASHSIZE, 1);
+	if (thumbprints == NULL)
+		return NULL;
+	thumbprints->count = 0;
+
+	for (i = 0; thumbprints_txt[i] != '\0'; ) {
+		// Eliminate blank lines
+		if (thumbprints_txt[i] == '\n') {
+			i++;
+			continue;
+		}
+		// Eliminate lines that don't start by an hexadecimal digit
+		if (!IS_HEXASCII(thumbprints_txt[i])) {
+			while (thumbprints_txt[i] != '\n' && thumbprints_txt[i] != '\0')
+				i++;
+			continue;
+		}
+		for (j = 0; thumbprints_txt[i] != '\n' && thumbprints_txt[i] != '\0'; i++, j++) {
+			if (!IS_HEXASCII(thumbprints_txt[i]))
+				break;
+			if ((j / 2) >= SHA1_HASHSIZE)
+				break;
+			thumbprints->list[thumbprints->count][j / 2] = thumbprints->list[thumbprints->count][j / 2] << 4;
+			thumbprints->list[thumbprints->count][j / 2] |= FROM_HEXASCII(thumbprints_txt[i]);
+			if (j == 2 * SHA1_HASHSIZE - 1)
+				thumbprints->count++;
+		}
+		while (thumbprints_txt[i] != '\n' && thumbprints_txt[i] != '\0')
+			i++;
+	}
+
+	if (thumbprints->count == 0) {
+		free(thumbprints);
+		return NULL;
+	}
+
+	return thumbprints;
 }
 
 /*

@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Windows User Experience
- * Copyright © 2022-2024 Pete Batard <pete@akeo.ie>
+ * Copyright © 2022-2025 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -25,8 +25,10 @@
 
 #include "rufus.h"
 #include "vhd.h"
+#include "xml.h"
 #include "drive.h"
 #include "format.h"
+#include "wimlib.h"
 #include "missing.h"
 #include "resource.h"
 #include "registry.h"
@@ -47,7 +49,6 @@ int unattend_xml_mask = UNATTEND_DEFAULT_SELECTION_MASK;
 char *unattend_xml_path = NULL, unattend_username[MAX_USERNAME_LENGTH];
 BOOL is_bootloader_revoked = FALSE;
 
-extern uint32_t wim_nb_files, wim_proc_files, wim_extra_files;
 extern BOOL validate_md5sum;
 extern uint64_t md5sum_totalbytes;
 extern StrArray modified_files;
@@ -63,7 +64,7 @@ extern const char* efi_archname[ARCH_MAX];
 char* CreateUnattendXml(int arch, int flags)
 {
 	const static char* xml_arch_names[5] = { "x86", "amd64", "arm", "arm64" };
-	const static char* unallowed_account_names[] = { "Administrator", "Guest", "KRBTGT", "Local" };
+	const static char* unallowed_account_names[] = { "Administrator", "Guest", "KRBTGT", "Local", "NONE" };
 	static char path[MAX_PATH];
 	char* tzstr;
 	FILE* fd;
@@ -163,56 +164,52 @@ char* CreateUnattendXml(int arch, int flags)
 					free(tzstr);
 				}
 			}
-			if (flags & UNATTEND_SET_USER || flags & UNATTEND_USE_MS2023_BOOTLOADERS) {
-				if (flags & UNATTEND_SET_USER) {
-					for (i = 0; (i < ARRAYSIZE(unallowed_account_names)) && (stricmp(unattend_username, unallowed_account_names[i]) != 0); i++);
-					if (i < ARRAYSIZE(unallowed_account_names)) {
-						uprintf("WARNING: '%s' is not allowed as local account name - Option ignored", unattend_username);
-					} else if (unattend_username[0] != 0) {
-						uprintf("• Use '%s' for local account name", unattend_username);
-						// If we create a local account in unattend.xml, then we can get Windows 11
-						// 22H2 to skip MSA even if the network is connected during installation.
-						fprintf(fd, "      <UserAccounts>\n");
-						fprintf(fd, "        <LocalAccounts>\n");
-						fprintf(fd, "          <LocalAccount wcm:action=\"add\">\n");
-						fprintf(fd, "            <Name>%s</Name>\n", unattend_username);
-						fprintf(fd, "            <DisplayName>%s</DisplayName>\n", unattend_username);
-						fprintf(fd, "            <Group>Administrators;Power Users</Group>\n");
-						// Sets an empty password for the account (which, in Microsoft's convoluted ways,
-						// needs to be initialized to the Base64 encoded UTF-16 string "Password").
-						// The use of an empty password has both the advantage of not having to ask users
-						// to type in a password in Rufus (which they might be weary of) as well as allowing
-						// automated logon during setup.
-						fprintf(fd, "            <Password>\n");
-						fprintf(fd, "              <Value>UABhAHMAcwB3AG8AcgBkAA==</Value>\n");
-						fprintf(fd, "              <PlainText>false</PlainText>\n");
-						fprintf(fd, "            </Password>\n");
-						fprintf(fd, "          </LocalAccount>\n");
-						fprintf(fd, "        </LocalAccounts>\n");
-						fprintf(fd, "      </UserAccounts>\n");
-						// Since we set a blank password, we'll ask the user to change it at next logon.
-						fprintf(fd, "      <FirstLogonCommands>\n");
-						fprintf(fd, "        <SynchronousCommand wcm:action=\"add\">\n");
-						fprintf(fd, "          <Order>%d</Order>\n", order++);
-						fprintf(fd, "          <CommandLine>net user &quot;%s&quot; /logonpasswordchg:yes</CommandLine>\n", unattend_username);
-						fprintf(fd, "        </SynchronousCommand>\n");
-						// Some people report that using the `net user` command above might reset the password expiration to 90 days...
-						// To alleviate that, blanket set passwords on the target machine to never expire.
-						fprintf(fd, "        <SynchronousCommand wcm:action=\"add\">\n");
-						fprintf(fd, "          <Order>%d</Order>\n", order++);
-						fprintf(fd, "          <CommandLine>net accounts /maxpwage:unlimited</CommandLine>\n");
-						fprintf(fd, "        </SynchronousCommand>\n");
-						fprintf(fd, "      </FirstLogonCommands>\n");
-					}
-				}
-				if (flags & UNATTEND_USE_MS2023_BOOTLOADERS) {
-					uprintf("• Use 'Windows UEFI CA 2023' signed bootloaders");
-					// TODO: Validate that we can have multiple <FirstLogonCommands> sections
+			if (flags & UNATTEND_SET_USER) {
+				for (i = 0; (i < ARRAYSIZE(unallowed_account_names)) && (stricmp(unattend_username, unallowed_account_names[i]) != 0); i++);
+				if (i < ARRAYSIZE(unallowed_account_names)) {
+					uprintf("WARNING: '%s' is not allowed as local account name - Option ignored", unattend_username);
+				} else if (unattend_username[0] != 0) {
+					char* org_username = safe_strdup(unattend_username);
+					// Per https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/unattend/microsoft-windows-shell-setup-useraccounts-localaccounts-localaccount-name
+					// Add '.' to the list because some folks also reported an issue with local accounts that have dots...
+					filter_chars(unattend_username, "/\\[]:|<>+=;,?*%@.", '_');
+					uprintf("• Use '%s' for local account name", unattend_username);
+					if (strcmp(org_username, unattend_username) != 0)
+						uprintf("WARNING: Local account name contained unallowed characters and has been sanitized");
+					free(org_username);
+					// If we create a local account in unattend.xml, then we can get Windows 11
+					// 22H2 to skip MSA even if the network is connected during installation.
+					fprintf(fd, "      <UserAccounts>\n");
+					fprintf(fd, "        <LocalAccounts>\n");
+					fprintf(fd, "          <LocalAccount wcm:action=\"add\">\n");
+					fprintf(fd, "            <Name>%s</Name>\n", unattend_username);
+					fprintf(fd, "            <DisplayName>%s</DisplayName>\n", unattend_username);
+					fprintf(fd, "            <Group>Administrators;Power Users</Group>\n");
+					// Sets an empty password for the account (which, in Microsoft's convoluted ways,
+					// needs to be initialized to the Base64 encoded UTF-16 string "Password").
+					// The use of an empty password has both the advantage of not having to ask users
+					// to type in a password in Rufus (which they might be weary of) as well as allowing
+					// automated logon during setup.
+					fprintf(fd, "            <Password>\n");
+					fprintf(fd, "              <Value>UABhAHMAcwB3AG8AcgBkAA==</Value>\n");
+					fprintf(fd, "              <PlainText>false</PlainText>\n");
+					fprintf(fd, "            </Password>\n");
+					fprintf(fd, "          </LocalAccount>\n");
+					fprintf(fd, "        </LocalAccounts>\n");
+					fprintf(fd, "      </UserAccounts>\n");
+					// Since we set a blank password, we'll ask the user to change it at next logon.
+					// NB: In case you wanna try, please be aware that Microsoft doesn't let you have multiple
+					// <FirstLogonCommands> sections in unattend.xml. Don't ask me how I know... :(
 					fprintf(fd, "      <FirstLogonCommands>\n");
 					fprintf(fd, "        <SynchronousCommand wcm:action=\"add\">\n");
 					fprintf(fd, "          <Order>%d</Order>\n", order++);
-					// TODO: Validate the actual value on a machine where updates have been applied
-					fprintf(fd, "          <CommandLine>reg add HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Secureboot /v AvailableUpdates /t REG_DWORD /d 0x3c0 /f\n");
+					fprintf(fd, "          <CommandLine>net user &quot;%s&quot; /logonpasswordchg:yes</CommandLine>\n", unattend_username);
+					fprintf(fd, "        </SynchronousCommand>\n");
+					// Some people report that using the `net user` command above might reset the password expiration to 90 days...
+					// To alleviate that, blanket set passwords on the target machine to never expire.
+					fprintf(fd, "        <SynchronousCommand wcm:action=\"add\">\n");
+					fprintf(fd, "          <Order>%d</Order>\n", order++);
+					fprintf(fd, "          <CommandLine>net accounts /maxpwage:unlimited</CommandLine>\n");
 					fprintf(fd, "        </SynchronousCommand>\n");
 					fprintf(fd, "      </FirstLogonCommands>\n");
 				}
@@ -273,6 +270,9 @@ char* CreateUnattendXml(int arch, int flags)
 		}
 		fprintf(fd, "  </settings>\n");
 	}
+
+	if (flags & UNATTEND_USE_MS2023_BOOTLOADERS)
+		uprintf("• Use 'Windows CA 2023' signed bootloaders");
 
 	fprintf(fd, "</unattend>\n");
 	fclose(fd);
@@ -418,24 +418,24 @@ out:
 /// <summary>
 /// Populate the img_report Window version from an install[.wim|.esd] XML index
 /// </summary>
-/// <param name="xml_file">The path of the extracted index XML.</param>
+/// <param name="xml">The index XML data.</param>
+/// <param name="xml_len">The length of the index XML data.</param>
 /// <param name="index">The index of the occurrence to look for.</param>
-static void PopulateWindowsVersionFromXml(const char* xml_file, int index)
+static void PopulateWindowsVersionFromXml(const wchar_t* xml, size_t xml_len, int index)
 {
 	char* val;
+	ezxml_t pxml = ezxml_parse_str((char*)xml, xml_len);
+	if (pxml == NULL)
+		return;
 
-	val = get_token_data_file_indexed("MAJOR", xml_file, index);
+	val = ezxml_get_val(pxml, "IMAGE", index, "WINDOWS", 0, "VERSION", 0, "MAJOR", -1);
 	img_report.win_version.major = (uint16_t)safe_atoi(val);
-	free(val);
-	val = get_token_data_file_indexed("MINOR", xml_file, index);
+	val = ezxml_get_val(pxml, "IMAGE", index, "WINDOWS", 0, "VERSION", 0, "MINOR", -1);
 	img_report.win_version.minor = (uint16_t)safe_atoi(val);
-	free(val);
-	val = get_token_data_file_indexed("BUILD", xml_file, index);
+	val = ezxml_get_val(pxml, "IMAGE", index, "WINDOWS", 0, "VERSION", 0, "BUILD", -1);
 	img_report.win_version.build = (uint16_t)safe_atoi(val);
-	free(val);
-	val = get_token_data_file_indexed("SPBUILD", xml_file, index);
+	val = ezxml_get_val(pxml, "IMAGE", index, "WINDOWS", 0, "VERSION", 0, "SPBUILD", -1);
 	img_report.win_version.revision = (uint16_t)safe_atoi(val);
-	free(val);
 	// Adjust versions so that we produce a more accurate report in the log
 	// (and yeah, I know we won't properly report Server, but I don't care)
 	if (img_report.win_version.major <= 5) {
@@ -463,55 +463,49 @@ static void PopulateWindowsVersionFromXml(const char* xml_file, int index)
 		if (img_report.win_version.build > 20000)
 			img_report.win_version.major = 11;
 	}
+	ezxml_free(pxml);
 }
 
 /// <summary>
-/// Populate the img_report Window version from an an install[.wim|.esd], mounting the
-/// ISO if needed. Requires Windows 8 or later.
+/// Populate the img_report Window version from an install[.wim|.esd].
 /// </summary>
 /// <param name="">(none)</param>
 /// <returns>TRUE on success, FALSE if we couldn't populate the version.</returns>
 BOOL PopulateWindowsVersion(void)
 {
-	char *mounted_iso, mounted_image_path[128];
-	char xml_file[MAX_PATH] = "";
+	int r;
+	char wim_path[4 * MAX_PATH] = "";
+	wchar_t* xml = NULL;
+	size_t xml_len;
+	WIMStruct* wim = NULL;
 
 	memset(&img_report.win_version, 0, sizeof(img_report.win_version));
 
-	if ((WindowsVersion.Version < WINDOWS_8) || ((WimExtractCheck(TRUE) & 4) == 0))
-		return FALSE;
-
-	// If we're not using a straight install.wim, we need to mount the ISO to access it
+	assert(safe_strlen(image_path) + 1 < ARRAYSIZE(wim_path));
+	static_strcpy(wim_path, image_path);
 	if (!img_report.is_windows_img) {
-		mounted_iso = VhdMountImage(image_path);
-		if (mounted_iso == NULL) {
-			uprintf("Could not mount Windows ISO for build number detection");
-			return FALSE;
-		}
-		static_sprintf(mounted_image_path, "%s%s", mounted_iso, &img_report.wininst_path[0][2]);
+		assert(safe_strlen(image_path) + safe_strlen(&img_report.wininst_path[0][3]) + 1 < ARRAYSIZE(wim_path));
+		static_strcat(wim_path, "|");
+		static_strcat(wim_path, &img_report.wininst_path[0][3]);
 	}
 
-	// Now take a look at the XML file in install.wim to list our versions
-	if ((GetTempFileNameU(temp_dir, APPLICATION_NAME, 0, xml_file) == 0) || (xml_file[0] == 0)) {
-		// Last ditch effort to get a tmp file - just extract it to the current directory
-		static_strcpy(xml_file, ".\\RufVXml.tmp");
-	}
-	// GetTempFileName() may leave a file behind
-	DeleteFileU(xml_file);
-
-	// Must use the Windows WIM API as 7z messes up the XML
-	if (!WimExtractFile_API(img_report.is_windows_img ? image_path : mounted_image_path,
-		0, "[1].xml", xml_file, TRUE)) {
-		uprintf("Could not acquire WIM index");
+	r = wimlib_open_wimU(wim_path, 0, &wim);
+	if (r != 0) {
+		uprintf("Could not open WIM: Error %d", r);
 		goto out;
 	}
 
-	PopulateWindowsVersionFromXml(xml_file, 1);
+	r = wimlib_get_xml_data(wim, (void**)&xml, &xml_len);
+	if (r != 0) {
+		uprintf("Could not read WIM XML index: Error %d", r);
+		goto out;
+	}
+
+	PopulateWindowsVersionFromXml(xml, xml_len, 0);
 
 out:
-	DeleteFileU(xml_file);
-	if (!img_report.is_windows_img)
-		VhdUnmountImage();
+	free(xml);
+	wimlib_free(wim);
 
 	return ((img_report.win_version.major != 0) && (img_report.win_version.build != 0));
 }
@@ -549,20 +543,20 @@ BOOL CopySKUSiPolicy(const char* drive_name)
 /// <returns>-2 on user cancel, -1 on other error, >=0 on success.</returns>
 int SetWinToGoIndex(void)
 {
-	char* mounted_iso, mounted_image_path[128];
-	char xml_file[MAX_PATH] = "";
+	int i, r;
+	WIMStruct* wim = NULL;
 	char* install_names[MAX_WININST];
-	StrArray version_name, version_index;
-	int i;
+	wchar_t wim_path[4 * MAX_PATH] = L"", *xml = NULL;
+	size_t xml_len;
+	StrArray version_name = { 0 }, version_index = { 0 };
 	BOOL bNonStandard = FALSE;
+	ezxml_t index = NULL, image = NULL;
 
 	// Sanity checks
 	wintogo_index = -1;
 	wininst_index = 0;
-	if ((WindowsVersion.Version < WINDOWS_8) || ((WimExtractCheck(FALSE) & 4) == 0) ||
-		(ComboBox_GetCurItemData(hFileSystem) != FS_NTFS)) {
+	if (ComboBox_GetCurItemData(hFileSystem) != FS_NTFS)
 		return -1;
-	}
 
 	// If we have multiple windows install images, ask the user the one to use
 	if (img_report.wininst_index > 1) {
@@ -575,51 +569,49 @@ int SetWinToGoIndex(void)
 			wininst_index = 0;
 	}
 
-	// If we're not using a straight install.wim, we need to mount the ISO to access it
+	assert(utf8_to_wchar_get_size(image_path) <= ARRAYSIZE(wim_path));
+	utf8_to_wchar_no_alloc(image_path, wim_path, ARRAYSIZE(wim_path));
 	if (!img_report.is_windows_img) {
-		mounted_iso = VhdMountImage(image_path);
-		if (mounted_iso == NULL) {
-			uprintf("Could not mount ISO for Windows To Go selection");
-			return -1;
-		}
-		static_sprintf(mounted_image_path, "%s%s", mounted_iso, &img_report.wininst_path[wininst_index][2]);
+		wcscat(wim_path, L"|");
+		assert(utf8_to_wchar_get_size(image_path) + utf8_to_wchar_get_size(&img_report.wininst_path[wininst_index][2]) <= ARRAYSIZE(wim_path));
+		utf8_to_wchar_no_alloc(&img_report.wininst_path[wininst_index][2],
+			&wim_path[wcslen(wim_path)], (int)ARRAYSIZE(wim_path) - wcslen(wim_path));
 	}
 
-	// Now take a look at the XML file in install.wim to list our versions
-	if ((GetTempFileNameU(temp_dir, APPLICATION_NAME, 0, xml_file) == 0) || (xml_file[0] == 0)) {
-		// Last ditch effort to get a tmp file - just extract it to the current directory
-		static_strcpy(xml_file, ".\\RufVXml.tmp");
+	r = wimlib_open_wim(wim_path, 0, &wim);
+	if (r != 0) {
+		uprintf("Could not open WIM: %d", r);
+		goto out;
 	}
-	// GetTempFileName() may leave a file behind
-	DeleteFileU(xml_file);
-
-	// Must use the Windows WIM API as 7z messes up the XML
-	if (!WimExtractFile_API(img_report.is_windows_img ? image_path : mounted_image_path,
-		0, "[1].xml", xml_file, FALSE)) {
-		uprintf("Could not acquire WIM index");
+	r = wimlib_get_xml_data(wim, (void**)&xml, &xml_len);
+	if (r != 0) {
+		uprintf("Could not read WIM XML index: %d", r);
 		goto out;
 	}
 
 	StrArrayCreate(&version_name, 16);
 	StrArrayCreate(&version_index, 16);
-	for (i = 0; StrArrayAdd(&version_index, get_token_data_file_indexed("IMAGE INDEX", xml_file, i + 1), FALSE) >= 0; i++) {
+	index = ezxml_parse_str((char*)xml, xml_len);
+	if (index == NULL) {
+		uprintf("Could not parse WIM XML");
+		goto out;
+	}
+
+	for (i = 0, image = ezxml_child(index, "IMAGE");
+		StrArrayAdd(&version_index, ezxml_attr(image, "INDEX"), TRUE) >= 0;
+		image = image->next, i++) {
 		// Some people are apparently creating *unofficial* Windows ISOs that don't have DISPLAYNAME elements.
-		// If we are parsing such an ISO, try to fall back to using DESCRIPTION. Of course, since we don't use
-		// a formal XML parser, if an ISO mixes entries with both DISPLAYNAME and DESCRIPTION and others with
-		// only DESCRIPTION, the version names we report will be wrong.
-		// But hey, there's only so far I'm willing to go to help people who, not content to have demonstrated
-		// their utter ignorance on development matters, are also trying to lecture experienced developers
-		// about specific "noob mistakes"... that don't exist in the code they are trying to criticize.
-		if (StrArrayAdd(&version_name, get_token_data_file_indexed("DISPLAYNAME", xml_file, i + 1), FALSE) < 0) {
-			bNonStandard = TRUE;
-			if (StrArrayAdd(&version_name, get_token_data_file_indexed("DESCRIPTION", xml_file, i + 1), FALSE) < 0) {
-				uprintf("Warning: Could not find a description for image index %d", i + 1);
+		// If we are parsing such an ISO, try to fall back to using DESCRIPTION.
+		if (StrArrayAdd(&version_name, ezxml_child_val(image, "DISPLAYNAME"), TRUE) < 0) {
+			if (StrArrayAdd(&version_name, ezxml_child_val(image, "DESCRIPTION"), TRUE) < 0) {
+				uprintf("WARNING: Could not find a description for image index %d", i + 1);
 				StrArrayAdd(&version_name, "Unknown Windows Version", TRUE);
 			}
+			bNonStandard = TRUE;
 		}
 	}
 	if (bNonStandard)
-		uprintf("Warning: Nonstandard Windows image (missing <DISPLAYNAME> entries)");
+		uprintf("WARNING: Nonstandard Windows image (missing <DISPLAYNAME> entries)");
 
 	if (i > 1)
 		// NB: _log2 returns -2 if SelectionDialog() returns negative (user cancelled)
@@ -632,16 +624,15 @@ int SetWinToGoIndex(void)
 		wintogo_index = atoi(version_index.String[i - 1]);
 	if (i > 0) {
 		// re-populate the version data from the selected XML index
-		PopulateWindowsVersionFromXml(xml_file, i);
+		PopulateWindowsVersionFromXml(xml, xml_len, i - 1);
 		// If we couldn't obtain the major and build, we have a problem
 		if (img_report.win_version.major == 0 || img_report.win_version.build == 0)
-			uprintf("Warning: Could not obtain version information from XML index (Nonstandard Windows image?)");
+			uprintf("WARNING: Could not obtain version information from XML index (Nonstandard Windows image?)");
 		uprintf("Will use '%s' (Build: %d, Index %s) for Windows To Go",
 			version_name.String[i - 1], img_report.win_version.build, version_index.String[i - 1]);
 		// Need Windows 10 Creator Update or later for boot on REMOVABLE to work
 		if ((img_report.win_version.build < 15000) && (SelectedDrive.MediaType != FixedMedia)) {
-			if (MessageBoxExU(hMainDialog, lmprintf(MSG_098), lmprintf(MSG_190),
-				MB_YESNO | MB_ICONWARNING | MB_IS_RTL, selected_langid) != IDYES)
+			if (Notification(MB_YESNO | MB_ICONWARNING, lmprintf(MSG_190), lmprintf(MSG_098)) != IDYES)
 				wintogo_index = -2;
 		}
 		// Display a notice about WppRecorder.sys for 1809 ISOs
@@ -649,16 +640,16 @@ int SetWinToGoIndex(void)
 			notification_info more_info;
 			more_info.id = MORE_INFO_URL;
 			more_info.url = WPPRECORDER_MORE_INFO_URL;
-			Notification(MSG_INFO, NULL, &more_info, lmprintf(MSG_128, "Windows To Go"), lmprintf(MSG_133));
+			NotificationEx(MB_ICONINFORMATION | MB_CLOSE, NULL, &more_info, lmprintf(MSG_128, "Windows To Go"), lmprintf(MSG_133));
 		}
 	}
-	StrArrayDestroy(&version_name);
-	StrArrayDestroy(&version_index);
 
 out:
-	DeleteFileU(xml_file);
-	if (!img_report.is_windows_img)
-		VhdUnmountImage();
+	StrArrayDestroy(&version_name);
+	StrArrayDestroy(&version_index);
+	free(xml);
+	ezxml_free(index);
+	wimlib_free(wim);
 	return wintogo_index;
 }
 
@@ -674,7 +665,7 @@ out:
 /// <returns>TRUE on success, FALSE on error.</returns>
 BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 {
-	char *mounted_iso, *ms_efi = NULL, mounted_image_path[128], cmd[MAX_PATH];
+	char *ms_efi = NULL, wim_path[4 * MAX_PATH], cmd[MAX_PATH];
 	ULONG cluster_size;
 
 	uprintf("Windows To Go mode selected");
@@ -684,28 +675,21 @@ BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 		return FALSE;
 	}
 
+	assert(safe_strlen(image_path) < ARRAYSIZE(wim_path));
+	static_strcpy(wim_path, image_path);
 	if (!img_report.is_windows_img) {
-		mounted_iso = VhdMountImage(image_path);
-		if (mounted_iso == NULL) {
-			uprintf("Could not mount ISO for Windows To Go installation");
-			ErrorStatus = RUFUS_ERROR(APPERR(ERROR_ISO_EXTRACT));
-			return FALSE;
-		}
-		static_sprintf(mounted_image_path, "%s%s", mounted_iso, &img_report.wininst_path[wininst_index][2]);
-		uprintf("Mounted ISO as '%s'", mounted_iso);
+		assert(safe_strlen(image_path) + safe_strlen(&img_report.wininst_path[wininst_index][3]) + 1 < ARRAYSIZE(wim_path));
+		static_strcat(wim_path, "|");
+		static_strcat(wim_path, &img_report.wininst_path[wininst_index][3]);
 	}
 
 	// Now we use the WIM API to apply that image
-	if (!WimApplyImage(img_report.is_windows_img ? image_path : mounted_image_path, wintogo_index, drive_name)) {
+	if (!WimApplyImage(wim_path, wintogo_index, drive_name)) {
 		uprintf("Failed to apply Windows To Go image");
 		if (!IS_ERROR(ErrorStatus))
 			ErrorStatus = RUFUS_ERROR(APPERR(ERROR_ISO_EXTRACT));
-		if (!img_report.is_windows_img)
-			VhdUnmountImage();
 		return FALSE;
 	}
-	if (!img_report.is_windows_img)
-		VhdUnmountImage();
 
 	if (use_esp) {
 		uprintf("Setting up EFI System Partition");
@@ -724,7 +708,7 @@ BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 		// completely neuter it) and IVdsDiskPartitionMF::FormatPartitionEx(), which is what you are supposed to
 		// use for ESPs, explicitly states: "This method cannot be used to format removable media."
 		if (!FormatPartition(DriveIndex, SelectedDrive.Partition[partition_index[PI_ESP]].Offset, cluster_size, FS_FAT32, "",
-			FP_QUICK | FP_FORCE | FP_LARGE_FAT32 | FP_NO_BOOT)) {
+			FP_QUICK | FP_FORCE | FP_LARGE_FAT32 | FP_NO_BOOT | FP_NO_PROGRESS)) {
 			uprintf("Could not format EFI System Partition");
 			return FALSE;
 		}
@@ -757,7 +741,7 @@ BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 
 	CopySKUSiPolicy((use_esp) ? ms_efi : drive_name);
 
-	UpdateProgressWithInfo(OP_FILE_COPY, MSG_267, wim_proc_files + 2 * wim_extra_files, wim_nb_files);
+	UpdateProgressWithInfo(OP_FILE_COPY, MSG_267, 99, 100);
 
 	// Setting internal drives offline for Windows To Go is crucial if, for instance, you are using ReFS
 	// on Windows 10 (therefore ReFS v3.4) and don't want a Windows 11 To Go boot to automatically
@@ -779,7 +763,7 @@ BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 	uprintf(cmd);
 	RunCommand(cmd, sysnative_dir, usb_debug);
 
-	UpdateProgressWithInfo(OP_FILE_COPY, MSG_267, wim_nb_files, wim_nb_files);
+	UpdateProgressWithInfo(OP_FILE_COPY, MSG_267, 100, 100);
 
 	if (use_esp) {
 		Sleep(200);
@@ -798,22 +782,30 @@ BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 BOOL ApplyWindowsCustomization(char drive_letter, int flags)
 // NB: Work with a copy of unattend_xml_flags as a paremeter since we will modify it.
 {
-	BOOL r = FALSE, is_hive_mounted = FALSE;
-	int i, wim_index = 2;
+	BOOL r = FALSE, is_hive_mounted = FALSE, update_boot_wim = FALSE;
+	int i, wim_index = 2, wuc_index = 0, num_replaced = 0;
 	const char* offline_hive_name = "RUFUS_OFFLINE_HIVE";
+	const char* reg_path = "Windows\\System32\\config\\SYSTEM";
+	const char* efi_ex_path = "Windows\\Boot\\EFI_EX";
+	const char* fonts_ex_path = "Windows\\Boot\\Fonts_EX";
 	char boot_wim_path[] = "?:\\sources\\boot.wim", key_path[64];
+	char tmp_path[2][MAX_PATH] = { "", "" };
 	char appraiserres_dll_src[] = "?:\\sources\\appraiserres.dll";
 	char appraiserres_dll_dst[] = "?:\\sources\\appraiserres.bak";
 	char setup_exe[] = "?:\\setup.exe";
 	char setup_dll[] = "?:\\setup.dll";
 	char md5sum_path[] = "?:\\md5sum.txt";
-	char *mount_path = NULL, path[MAX_PATH];
+	char path[MAX_PATH], *rep, *tmp_dir_end;
 	uint8_t* buf = NULL;
 	uint16_t setup_arch;
+	size_t len;
 	HKEY hKey = NULL, hSubKey = NULL;
 	LSTATUS status;
 	DWORD dwDisp, dwVal = 1, dwSize;
 	FILE* fd_md5sum;
+	WIMStruct* wim;
+	StrArray files;
+	struct wimlib_update_command wuc[2] = { 0 };
 
 	assert(unattend_xml_path != NULL);
 	uprintf("Applying Windows customization:");
@@ -891,30 +883,40 @@ BOOL ApplyWindowsCustomization(char drive_letter, int flags)
 		}
 
 		UpdateProgressWithInfoForce(OP_PATCH, MSG_325, 0, PATCH_PROGRESS_TOTAL);
-		// We only need to mount boot.wim if we have windowsPE data to deal with. If
-		// not, we can just copy our unattend.xml in \sources\$OEM$\$$\Panther\.
-		// We also need to mount it if we use the 'Windows UEFI CA 2023' signed bootloaders.
+		// We only need to alter boot.wim if we have windowsPE data to deal with.
+		// If not, we can just copy our unattend.xml in \sources\$OEM$\$$\Panther\.
 		if (flags & UNATTEND_WINPE_SETUP_MASK || flags & UNATTEND_USE_MS2023_BOOTLOADERS) {
 			if (validate_md5sum)
 				md5sum_totalbytes -= _filesizeU(boot_wim_path);
-			uprintf("Mounting '%s[%d]'...", boot_wim_path, wim_index);
 			// Some "unofficial" ISOs have a modified boot.wim that doesn't have Windows Setup at index 2...
-			if (!WimIsValidIndex(boot_wim_path, wim_index)) {
+			// TODO: we could try to look for "Microsoft Windows Setup" in the XML DESCRIPTION to locate the index
+			wimlib_global_init(0);
+			wimlib_set_print_errors(true);
+			update_boot_wim = (wimlib_open_wimU(boot_wim_path, WIMLIB_OPEN_FLAG_WRITE_ACCESS, &wim) == 0);
+			if (!update_boot_wim) {
+				uprintf("Could not open '%s'", boot_wim_path);
+				goto out;
+			}
+			// Setup image should be index 2
+			if (wimlib_resolve_image(wim, L"2") != 2) {
 				uprintf("WARNING: This image appears to be an UNOFFICIAL Windows ISO!");
 				uprintf("Rufus recommends that you only use OFFICIAL retail Microsoft Windows images, such as");
 				uprintf("the ones that can be downloaded through the download facility of this application.");
 				wim_index = 1;
 			}
-			mount_path = WimMountImage(boot_wim_path, wim_index);
-			if (mount_path == NULL)
-				goto out;
 		}
 
 		if (flags & UNATTEND_SECUREBOOT_TPM_MINRAM) {
+			if (GetTempDirNameU(temp_dir, APPLICATION_NAME, 0, tmp_path[0]) == 0) {
+				uprintf("WARNING: Could not create temp dir for registry changes");
+				goto copy_unattend;
+			}
+			static_sprintf(tmp_path[1], "%s\\SYSTEM", tmp_path[0]);
 			// Try to create the registry keys directly, and fallback to using unattend
 			// if that fails (which the Windows Store version is expected to do).
-			static_sprintf(path, "%s\\Windows\\System32\\config\\SYSTEM", mount_path);
-			if (!MountRegistryHive(HKEY_LOCAL_MACHINE, offline_hive_name, path)) {
+			if (wimlib_extract_pathsU(wim, wim_index, tmp_path[0], &reg_path, 1,
+					WIMLIB_EXTRACT_FLAG_NO_PRESERVE_DIR_STRUCTURE) != 0 ||
+				!MountRegistryHive(HKEY_LOCAL_MACHINE, offline_hive_name, tmp_path[1])) {
 				uprintf("Falling back to creating the registry keys through unattend.xml");
 				goto copy_unattend;
 			}
@@ -947,12 +949,18 @@ BOOL ApplyWindowsCustomization(char drive_letter, int flags)
 				}
 				uprintf("Created 'HKLM\\SYSTEM\\Setup\\LabConfig\\%s' registry key", bypass_name[i]);
 			}
+			wuc[wuc_index].op = WIMLIB_UPDATE_OP_ADD;
+			wuc[wuc_index].add.fs_source_path = utf8_to_wchar(tmp_path[1]);
+			tmp_path[1][0] = '\0';
+			wuc[wuc_index].add.wim_target_path = L"Windows\\System32\\config\\SYSTEM";
+			wuc_index++;
+
 			// We were successfull in creating the keys so disable the windowsPE section from unattend.xml
 			// We do this by replacing '<settings pass="windowsPE">' with '<settings pass="disabled">'
 			// (provided that the registry key creation was the only item for this pass)
 			if ((flags & UNATTEND_WINPE_SETUP_MASK) == UNATTEND_SECUREBOOT_TPM_MINRAM) {
 				if (replace_in_token_data(unattend_xml_path, "<settings", "windowsPE", "disabled", FALSE) == NULL)
-					uprintf("Warning: Could not disable 'windowsPE' pass from unattend.xml");
+					uprintf("WARNING: Could not disable 'windowsPE' pass from unattend.xml");
 				// Remove the flags, since we accomplished the registry creation outside of unattend.
 				flags &= ~UNATTEND_SECUREBOOT_TPM_MINRAM;
 			} else {
@@ -968,14 +976,13 @@ BOOL ApplyWindowsCustomization(char drive_letter, int flags)
 			// If we have a windowsPE section, copy the answer files to the root of boot.wim as
 			// Autounattend.xml. This also results in that file being automatically copied over
 			// to %WINDIR%\Panther\unattend.xml for later passes processing.
-			if_not_assert(mount_path != NULL)
+			if_assert_fails(update_boot_wim)
 				goto out;
-			static_sprintf(path, "%s\\Autounattend.xml", mount_path);
-			if (!CopyFileU(unattend_xml_path, path, TRUE)) {
-				uprintf("Could not create boot.wim 'Autounattend.xml': %s", WindowsErrorString());
-				goto out;
-			}
-			uprintf("Added 'Autounattend.xml' to '%s'", boot_wim_path);
+			wuc[wuc_index].op = WIMLIB_UPDATE_OP_ADD;
+			wuc[wuc_index].add.fs_source_path = utf8_to_wchar(unattend_xml_path);
+			wuc[wuc_index].add.wim_target_path = L"Autounattend.xml";
+			uprintf("Added '%S' to '%s'", wuc[wuc_index].add.wim_target_path, boot_wim_path);
+			wuc_index++;
 		} else {
 			// If there is no windowsPE section in our unattend, then copying it as Autounattend.xml on
 			// the root of boot.wim will not work as Windows Setup does *NOT* carry Autounattend.xml into
@@ -1000,57 +1007,70 @@ BOOL ApplyWindowsCustomization(char drive_letter, int flags)
 	}
 
 	if (flags & UNATTEND_USE_MS2023_BOOTLOADERS) {
-		if_not_assert(mount_path != NULL)
+		if_assert_fails(update_boot_wim)
 			goto out;
-		static_sprintf(path, "%s\\Windows\\Boot\\EFI_EX\\bootmgfw_EX.efi", mount_path);
-		if (!PathFileExistsU(path)) {
-			uprintf("Could not find 2023 signed UEFI bootloader - Ignoring option");
+		if (GetTempDirNameU(temp_dir, APPLICATION_NAME, 0, tmp_path[1]) == 0) {
+			uprintf("WARNING: Could not create temp dir for 2023 signed UEFI bootloaders");
+			goto out;
+		}
+		// If we have a '_EX' in the tmp name, we will have an issue
+		if_assert_fails(strstr(tmp_path[1], "_EX") == NULL)
+			goto out;
+		// Extract the EFI_EX and Fonts_EX files
+		if (wimlib_extract_pathsU(wim, wim_index, tmp_path[1], &efi_ex_path, 1,
+				WIMLIB_EXTRACT_FLAG_NO_ACLS | WIMLIB_EXTRACT_FLAG_NO_PRESERVE_DIR_STRUCTURE) != 0 ||
+			wimlib_extract_pathsU(wim, wim_index, tmp_path[1], &fonts_ex_path, 1,
+				WIMLIB_EXTRACT_FLAG_NO_ACLS | WIMLIB_EXTRACT_FLAG_NO_PRESERVE_DIR_STRUCTURE) != 0) {
+			uprintf("Could not extract 2023 signed UEFI bootloaders - Ignoring option");
 		} else {
-			char path2[MAX_PATH], *rep;
-			StrArray files, dirs;
+			len = strlen(tmp_path[1]);
+			tmp_dir_end = &tmp_path[1][len];
+
+			// Copy/override the Font files
+			static_strcat(tmp_path[1], "\\Fonts_EX");
+			StrArrayCreate(&files, 64);
+			ListDirectoryContent(&files, tmp_path[1], LIST_DIR_TYPE_FILE);
+			for (i = 0; i < (int)files.Index; i++) {
+				static_sprintf(path, "%c:\\efi\\microsoft\\boot%s", drive_letter, &files.String[i][len]);
+				rep = remove_substr(path, "_EX");
+				if (!CopyFileU(files.String[i], rep, FALSE))
+					uprintf("WARNING: Could not copy '%s': %s", path, WindowsErrorString());
+				else
+					num_replaced++;
+				safe_free(rep);
+			}
+			StrArrayDestroy(&files);
+
 			// Replace /EFI/Boot/boot###.efi
 			for (i = 1; i < ARRAYSIZE(efi_archname); i++) {
-				static_sprintf(path2, "%c:\\efi\\boot\\boot%s.efi", drive_letter, efi_archname[i]);
-				if (!PathFileExistsA(path2))
+				*tmp_dir_end = '\0';
+				static_strcat(tmp_path[1], "\\EFI_EX\\bootmgfw_EX.efi");
+				static_sprintf(path, "%c:\\efi\\boot\\boot%s.efi", drive_letter, efi_archname[i]);
+				if (!PathFileExistsA(path))
 					continue;
-				if (!CopyFileU(path, path2, FALSE))
+				if (!CopyFileU(tmp_path[1], path, FALSE))
 					uprintf("WARNING: Could not replace 'boot%s.efi': %s", efi_archname[i], WindowsErrorString());
+				else
+					num_replaced++;
 				break;
 			}
+
 			// Replace /bootmgr.efi
-			static_sprintf(path, "%s\\Windows\\Boot\\EFI_EX\\bootmgr_EX.efi", mount_path);
-			static_sprintf(path2, "%c:\\bootmgr.efi", drive_letter);
-			if (!CopyFileU(path, path2, FALSE))
+			*tmp_dir_end = '\0';
+			static_strcat(tmp_path[1], "\\EFI_EX\\bootmgr_EX.efi");
+			static_sprintf(path, "%c:\\bootmgr.efi", drive_letter);
+			if (!CopyFileU(tmp_path[1], path, FALSE))
 				uprintf("WARNING: Could not replace 'bootmgr.efi': %s", WindowsErrorString());
-			// Microsoft "secures" the Windows\Boot\ dir through their SUPER OBNOXIOUS AND
-			// WORTHLESS use of DACLs + read-only flags, so we first need to re-take control
-			// of all directories under there recursively.
-			StrArrayCreate(&dirs, 64);
-			StrArrayCreate(&files, 64);
-			static_sprintf(path, "%s\\Windows\\Boot\\", mount_path);
-			StrArrayAdd(&dirs, path, TRUE);
-			static_sprintf(path, "%s\\Windows\\Boot\\EFI_EX\\", mount_path);
-			StrArrayAdd(&dirs, path, TRUE);
-			ListDirectoryContent(&dirs, path, LIST_DIR_TYPE_DIRECTORY | LIST_DIR_TYPE_RECURSIVE);
-			for (i = 0; i < (int)dirs.Index; i++) {
-				rep = remove_substr(dirs.String[i], "_EX");
-				assert(rep != NULL);
-				TakeOwnership(rep);
-				safe_free(rep);
+			else
+				num_replaced++;
+			if (num_replaced != 0) {
+				uprintf("Replaced %d EFI bootloader files with 'Windows UEFI CA 2023' compatible versions.", num_replaced);
+				uprintf("Note that to boot this media, you must have a system where the 'Windows UEFI CA 2023'");
+				uprintf("Secure Boot certificate has been installed.");
+				uprintf("If needed, this can be accomplished using Mosby [https://github.com/pbatard/Mosby],");
+				uprintf("which can be found, ready to use, in the UEFI Shell ISO images downloaded by Rufus.");
 			}
-			// Now that we should be able to write to the destination directories, copy the content.
-			ListDirectoryContent(&files, path, LIST_DIR_TYPE_FILE | LIST_DIR_TYPE_RECURSIVE);
-			for (i = 0; i < (int)files.Index; i++) {
-				rep = remove_substr(files.String[i], "_EX");
-				assert(rep != NULL);
-				TakeOwnership(rep);
-				if (!CopyFileU(files.String[i], rep, FALSE) && rep != NULL)
-					uprintf("WARNING: Could not replace '%s': %s", &rep[strlen(mount_path) + 1], WindowsErrorString());
-				safe_free(rep);
-			}
-			StrArrayDestroy(&dirs);
-			StrArrayDestroy(&files);
-			uprintf("Replaced EFI bootloader files with 'Windows UEFI CA 2023' signed versions");
+			*tmp_dir_end = '\0';	// Else we won't be able to delete the temp dir
 		}
 	}
 
@@ -1065,15 +1085,25 @@ out:
 		UnmountRegistryHive(HKEY_LOCAL_MACHINE, offline_hive_name);
 		UpdateProgressWithInfoForce(OP_PATCH, MSG_325, 104, PATCH_PROGRESS_TOTAL);
 	}
-	if (mount_path) {
-		uprintf("Unmounting '%s[%d]'...", boot_wim_path, wim_index);
-		WimUnmountImage(boot_wim_path, wim_index, TRUE);
+	if (update_boot_wim) {
+		uprintf("Updating '%s[%d]'...", boot_wim_path, wim_index);
+		if (wimlib_update_image(wim, wim_index, wuc, wuc_index, 0) != 0 ||
+			wimlib_overwrite(wim, WIMLIB_WRITE_FLAG_RECOMPRESS, 0) != 0) {
+			uprintf("Error: Failed to update %s", boot_wim_path);
+			r = FALSE;
+		}
+		for (i = 0; i < ARRAYSIZE(tmp_path); i++)
+			if (tmp_path[i][0])
+				SHDeleteDirectoryExU(NULL, tmp_path[i], FOF_NO_UI);
+		for (i = 0; i < wuc_index; i++)
+			free(wuc[i].add.fs_source_path);
+		wimlib_free(wim);
+		wimlib_global_cleanup();
 		if (validate_md5sum) {
 			md5sum_totalbytes += _filesizeU(boot_wim_path);
 			StrArrayAdd(&modified_files, boot_wim_path, TRUE);
 		}
 		UpdateProgressWithInfo(OP_PATCH, MSG_325, PATCH_PROGRESS_TOTAL, PATCH_PROGRESS_TOTAL);
 	}
-	free(mount_path);
 	return r;
 }

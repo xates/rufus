@@ -6,7 +6,7 @@
  *
  * See also: https://utf8everywhere.org
  *
- * Copyright © 2010-2023 Pete Batard <pete@akeo.ie>
+ * Copyright © 2010-2025 Pete Batard <pete@akeo.ie>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -55,9 +55,13 @@ extern "C" {
 #define LTEXT(txt) _LTEXT(txt)
 
 #define wchar_to_utf8_no_alloc(wsrc, dest, dest_size) \
-	WideCharToMultiByte(CP_UTF8, 0, wsrc, -1, dest, dest_size, NULL, NULL)
+	WideCharToMultiByte(CP_UTF8, 0, wsrc, -1, dest, (int)(dest_size), NULL, NULL)
+#define wchar_to_utf8_get_size(wsrc) \
+	WideCharToMultiByte(CP_UTF8, 0, wsrc, -1, NULL, 0, NULL, NULL)
 #define utf8_to_wchar_no_alloc(src, wdest, wdest_size) \
-	MultiByteToWideChar(CP_UTF8, 0, src, -1, wdest, wdest_size)
+	MultiByteToWideChar(CP_UTF8, 0, src, -1, wdest, (int)(wdest_size))
+#define utf8_to_wchar_get_size(src) \
+	MultiByteToWideChar(CP_UTF8, 0, src, -1, NULL, 0)
 #define Edit_ReplaceSelU(hCtrl, str) ((void)SendMessageLU(hCtrl, EM_REPLACESEL, (WPARAM)FALSE, str))
 #define ComboBox_AddStringU(hCtrl, str) ((int)(DWORD)SendMessageLU(hCtrl, CB_ADDSTRING, (WPARAM)FALSE, str))
 #define ComboBox_InsertStringU(hCtrl, index, str) ((int)(DWORD)SendMessageLU(hCtrl, CB_INSERTSTRING, (WPARAM)index, str))
@@ -83,7 +87,7 @@ extern "C" {
 #define wfree(p) sfree(w ## p)
 
 /*
- * Converts an UTF-16 string to UTF8 (allocate returned string)
+ * Converts an UTF-16 string to UTF8 (allocates returned string)
  * Returns NULL on error
  */
 static __inline char* wchar_to_utf8(const wchar_t* wstr)
@@ -115,7 +119,7 @@ static __inline char* wchar_to_utf8(const wchar_t* wstr)
 }
 
 /*
- * Converts an UTF8 string to UTF-16 (allocate returned string)
+ * Converts an UTF8 string to UTF-16 (allocates returned string)
  * Returns NULL on error
  */
 static __inline wchar_t* utf8_to_wchar(const char* str)
@@ -146,7 +150,7 @@ static __inline wchar_t* utf8_to_wchar(const char* str)
 }
 
 /*
-* Converts an non NUL-terminated UTF-16 string of length len to UTF8 (allocate returned string)
+* Converts a non NUL-terminated UTF-16 string of length wlen to NUL-terminated UTF8 (allocates returned string)
 * Returns NULL on error
 */
 static __inline char* wchar_len_to_utf8(const wchar_t* wstr, int wlen)
@@ -174,14 +178,24 @@ static __inline DWORD FormatMessageU(DWORD dwFlags, LPCVOID lpSource, DWORD dwMe
 									 DWORD dwLanguageId, char* lpBuffer, DWORD nSize, va_list *Arguments)
 {
 	DWORD ret = 0, err = ERROR_INVALID_DATA;
-	// coverity[returned_null]
+	// Exclude support for the FORMAT_MESSAGE_ALLOCATE_BUFFER special case.
+	if (dwFlags & FORMAT_MESSAGE_ALLOCATE_BUFFER) {
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return 0;
+	}
 	walloc(lpBuffer, nSize);
+	if (wlpBuffer == NULL) {
+		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+		return 0;
+	}
 	ret = FormatMessageW(dwFlags, lpSource, dwMessageId, dwLanguageId, wlpBuffer, nSize, Arguments);
 	err = GetLastError();
 	if ((ret != 0) && ((ret = wchar_to_utf8_no_alloc(wlpBuffer, lpBuffer, nSize)) == 0)) {
 		err = GetLastError();
 		ret = 0;
 	}
+	// Coverity doesn't realise that we filtered out the FORMAT_MESSAGE_ALLOCATE_BUFFER case
+	// coverity[leaked_storage]
 	wfree(lpBuffer);
 	SetLastError(err);
 	return ret;
@@ -634,9 +648,8 @@ static __inline BOOL GetTextExtentPointU(HDC hdc, const char* lpString, LPSIZE l
 	return ret;
 }
 
-// A UTF-8 alternative to MS GetCurrentDirectory() since the latter is useless for
-// apps installed from the App Store...
-static __inline DWORD GetCurrentDirectoryU(DWORD nBufferLength, char* lpBuffer)
+// Gets the directory where the executable resises, through GetModuleFileName()
+static __inline DWORD GetAppDirectoryU(DWORD nBufferLength, char* lpBuffer)
 {
 	DWORD i, ret = 0, err = ERROR_INVALID_DATA;
 	// coverity[returned_null]
@@ -737,6 +750,17 @@ static __inline DWORD GetTempFileNameU(char* lpPathName, char* lpPrefixString, U
 	wfree(lpPrefixString);
 	wfree(lpPathName);
 	SetLastError(err);
+	return ret;
+}
+
+static __inline DWORD GetTempDirNameU(char* lpPathName, char* lpPrefixString, UINT uUnique, char* lpTempDirName)
+{
+	DWORD ret = GetTempFileNameU(lpPathName, lpPrefixString, uUnique, lpTempDirName);
+	if (ret != 0) {
+		DeleteFileU(lpTempDirName);
+		if (!CreateDirectoryU(lpTempDirName, NULL))
+			ret = 0;
+	}
 	return ret;
 }
 

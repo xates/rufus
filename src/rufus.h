@@ -1,6 +1,6 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
- * Copyright © 2011-2024 Pete Batard <pete@akeo.ie>
+ * Copyright © 2011-2025 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -58,14 +58,13 @@
 #endif
 #define COMPANY_NAME                "Akeo Consulting"
 #define STR_NO_LABEL                "NO_LABEL"
-// Yes, there exist characters between these seemingly empty quotes!
-#define LEFT_TO_RIGHT_MARK          "‎"
-#define RIGHT_TO_LEFT_MARK          "‏"
-#define LEFT_TO_RIGHT_EMBEDDING     "‪"
-#define RIGHT_TO_LEFT_EMBEDDING     "‫"
-#define POP_DIRECTIONAL_FORMATTING  "‬"
-#define LEFT_TO_RIGHT_OVERRIDE      "‭"
-#define RIGHT_TO_LEFT_OVERRIDE      "‮"
+#define LEFT_TO_RIGHT_MARK          "\u200e"
+#define RIGHT_TO_LEFT_MARK          "\u200f"
+#define LEFT_TO_RIGHT_EMBEDDING     "\u202a"
+#define RIGHT_TO_LEFT_EMBEDDING     "\u202b"
+#define POP_DIRECTIONAL_FORMATTING  "\u202c"
+#define LEFT_TO_RIGHT_OVERRIDE      "\u202d"
+#define RIGHT_TO_LEFT_OVERRIDE      "\u202e"
 #define DRIVE_ACCESS_TIMEOUT        15000		// How long we should retry drive access (in ms)
 #define DRIVE_ACCESS_RETRIES        150			// How many times we should retry
 #define DRIVE_INDEX_MIN             0x00000080
@@ -88,9 +87,10 @@
 #define MAX_IGNORE_USB              8			// Maximum number of USB drives we want to ignore
 #define MAX_ISO_TO_ESP_SIZE         (1 * GB)	// Maximum size we allow for the ISO → ESP option
 #define MAX_DEFAULT_LIST_CARD_SIZE  (500 * GB)	// Size above which we don't list a card without enable HDD or Alt-F
-#define MAX_SECTORS_TO_CLEAR        128			// nb sectors to zap when clearing the MBR/GPT (must be >34)
+#define MAX_SECTORS_TO_CLEAR        (8 * MB / 512)	// Sectors to zap when clearing the MBR/GPT (must be >34)
 #define MAX_USERNAME_LENGTH         128			// Maximum size we'll accept for a WUE specified username
 #define MAX_WININST                 4			// Max number of install[.wim|.esd] we can handle on an image
+#define MAX_MARKER                  80.0f		// Max number of '+' signs we display for progress
 #define MBR_UEFI_MARKER             0x49464555	// 'U', 'E', 'F', 'I', as a 32 bit little endian longword
 #define MORE_INFO_URL               0xFFFF
 #define PROJECTED_SIZE_RATIO        110			// Percentage by which we inflate projected_size to prevent persistence overflow
@@ -135,6 +135,15 @@
 #define DISKCOPY_SIZE               0x16ee00
 #define DISKCOPY_IMAGE_OFFSET       0x66d8
 #define DISKCOPY_IMAGE_SIZE         0x168000
+#if defined(_M_AMD64)
+#define OSCDIMG_URL                 "https://msdl.microsoft.com/download/symbols/oscdimg.exe/688CABB065000/oscdimg.exe"
+#elif defined(_M_IX86)
+#define OSCDIMG_URL                 "https://msdl.microsoft.com/download/symbols/oscdimg.exe/704FD1B760000/oscdimg.exe"
+#elif defined(_M_ARM64)
+#define OSCDIMG_URL                 "https://msdl.microsoft.com/download/symbols/oscdimg.exe/02633D8D66000/oscdimg.exe"
+#elif defined(_M_ARM)
+#define OSCDIMG_URL                 "https://msdl.microsoft.com/download/symbols/oscdimg.exe/9CD825745F000/oscdimg.exe"
+#endif
 #define SYMBOL_SERVER_USER_AGENT    "Microsoft-Symbol-Server/10.0.22621.755"
 #define DEFAULT_ESP_MOUNT_POINT     "S:\\"
 #define IS_POWER_OF_2(x)            ((x != 0) && (((x) & ((x) - 1)) == 0))
@@ -159,7 +168,7 @@
 #define safe_mm_free(p) do { _mm_free((void*)p); p = NULL; } while(0)
 static __inline void safe_strcp(char* dst, const size_t dst_max, const char* src, const size_t count) {
 	memmove(dst, src, min(count, dst_max));
-	dst[min(count, dst_max) - 1] = 0;
+	if (dst != NULL) dst[min(count, dst_max) - 1] = 0;
 }
 #define safe_strcpy(dst, dst_max, src) safe_strcp(dst, dst_max, src, safe_strlen(src) + 1)
 #define static_strcpy(dst, src) safe_strcpy(dst, sizeof(dst), src)
@@ -172,8 +181,14 @@ static __inline void safe_strcp(char* dst, const size_t dst_max, const char* src
 #define safe_strnicmp(str1, str2, count) _strnicmp(((str1 == NULL) ? "<NULL>" : str1), ((str2 == NULL) ? "<NULL>" : str2), count)
 #define safe_closehandle(h) do { if ((h != INVALID_HANDLE_VALUE) && (h != NULL)) { CloseHandle(h); h = INVALID_HANDLE_VALUE; } } while(0)
 #define safe_release_dc(hDlg, hDC) do { if ((hDC != INVALID_HANDLE_VALUE) && (hDC != NULL)) { ReleaseDC(hDlg, hDC); hDC = NULL; } } while(0)
+#define safe_delete_object(hObj) do { if (hObj != NULL) { DeleteObject(hObj); hObj = NULL; } } while(0)
+#define safe_destroy_icon(hIcon) do { if (hIcon != NULL) { DestroyIcon(hIcon); hIcon = NULL; } } while(0)
+#define safe_destroy_imagelist(hImageList) do { if (hImageList != NULL) { ImageList_Destroy(hImageList); hImageList = NULL; } } while(0)
+#define safe_destroy_imagelist_from_toolbar(hToolbar) do { if (hToolbar != NULL) {                     \
+	HIMAGELIST _hImageList = (HIMAGELIST)SendMessage(hToolbar, TB_GETIMAGELIST, (WPARAM)0, (LPARAM)0); \
+	safe_destroy_imagelist(_hImageList); } } while(0)
 #define safe_sprintf(dst, count, ...) do { size_t _count = count; char* _dst = dst; _snprintf_s(_dst, _count, _TRUNCATE, __VA_ARGS__); \
-	_dst[(_count) - 1] = 0; } while(0)
+	if (_dst != NULL) _dst[(_count) - 1] = 0; } while(0)
 #define static_sprintf(dst, ...) safe_sprintf(dst, sizeof(dst), __VA_ARGS__)
 #define safe_atoi(str) ((((char*)(str))==NULL) ? 0 : atoi(str))
 #define safe_strlen(str) ((((char*)(str))==NULL) ? 0 : strlen(str))
@@ -190,10 +205,13 @@ static __inline void static_repchr(char* p, char s, char r) {
 }
 #define to_unix_path(str) static_repchr(str, '\\', '/')
 #define to_windows_path(str) static_repchr(str, '/', '\\')
-#define if_not_assert(cond) assert(cond); if (!(cond))
+#define if_assert_fails(cond) assert(cond); if (!(cond))
+#define if_assert_succeeds(cond) assert(cond); if ((cond))
 
 extern void uprintf(const char *format, ...);
 extern void uprintfs(const char *str);
+extern void wuprintf(const wchar_t* format, ...);
+extern void uprint_progress(uint64_t cur_value, uint64_t max_value);
 #define vuprintf(...) do { if (verbose) uprintf(__VA_ARGS__); } while(0)
 #define vvuprintf(...) do { if (verbose > 1) uprintf(__VA_ARGS__); } while(0)
 #define suprintf(...) do { if (!bSilent) uprintf(__VA_ARGS__); } while(0)
@@ -226,13 +244,7 @@ enum user_message_type {
 };
 
 /* Custom notifications */
-enum notification_type {
-	MSG_INFO,
-	MSG_WARNING,
-	MSG_ERROR,
-	MSG_QUESTION,
-	MSG_WARNING_QUESTION
-};
+#define MB_CLOSE 0x0F
 typedef INT_PTR (CALLBACK *Callback_t)(HWND, UINT, WPARAM, LPARAM);
 typedef struct {
 	WORD id;
@@ -358,8 +370,11 @@ enum EFI_BOOT_TYPE {
 #define HAS_WINPE(r)        (((r.winpe & WINPE_I386) == WINPE_I386)||((r.winpe & WINPE_AMD64) == WINPE_AMD64)||((r.winpe & WINPE_MININT) == WINPE_MININT))
 #define HAS_WINDOWS(r)      (HAS_BOOTMGR(r) || (r.uses_minint) || HAS_WINPE(r))
 #define HAS_WIN7_EFI(r)     ((r.has_efi == 1) && HAS_WININST(r))
+#define HAS_FATLESS_GRUB(r) ((r.has_grub2 & 0x80) && !(r.has_grub2_fs & 0x1))
+#define HAS_NTFSLESS_GRUB(r)((r.has_grub2 & 0x80) && !(r.has_grub2_fs & 0x4))
 #define IS_WINDOWS_1X(r)    (r.has_bootmgr_efi && (r.win_version.major >= 10))
 #define IS_WINDOWS_11(r)    (r.has_bootmgr_efi && (r.win_version.major >= 11))
+#define IS_FAT32_COMPAT(r)  (((r.has_4GB_file == 0 && !HAS_FATLESS_GRUB(r)) || (r.has_4GB_file == 0x11 && allow_dual_uefi_bios)) && !r.needs_ntfs)
 #define HAS_EFI_IMG(r)      (r.efi_img_path[0] != 0)
 #define IS_DD_BOOTABLE(r)   (r.is_bootable_img > 0)
 #define IS_DD_ONLY(r)       ((r.is_bootable_img > 0) && (!r.is_iso || r.disable_iso))
@@ -379,7 +394,14 @@ typedef struct {
 	uint16_t revision;
 } winver_t;
 
-/* We can't use the Microsoft enums as we want to have RISC-V and LoongArch */
+/*
+ * We can't use the Microsoft enums as we want to have RISC-V and LoongArch
+ * and we also translate these to IDR_BASE + Value for resource items, which,
+ * if we were to use the Microsoft IMAGE_FILE_MACHINE constants, would force
+ * us to leave a 65536 sized gap between bases in order to properly map
+ * 0x8664 (x86_64), 0xaa64 (ARM64) and so on...
+ * NB: When editing this, make sure to also update the values in resource.h!
+ */
 enum ArchType {
 	ARCH_UNKNOWN = 0,
 	ARCH_X86_32,
@@ -418,10 +440,11 @@ typedef struct {
 	BOOLEAN rh8_derivative;
 	uint16_t winpe;
 	uint16_t has_efi;
+	uint8_t has_secureboot_bootloader;
 	uint8_t has_md5sum;
 	uint8_t wininst_index;
 	uint8_t has_symlinks;
-	BOOLEAN has_4GB_file;
+	uint8_t has_4GB_file;
 	BOOLEAN has_long_filename;
 	BOOLEAN has_deep_directories;
 	BOOLEAN has_bootmgr;
@@ -432,6 +455,7 @@ typedef struct {
 	BOOLEAN has_efi_syslinux;
 	BOOLEAN has_grub4dos;
 	uint8_t has_grub2;
+	uint8_t has_grub2_fs;
 	BOOLEAN has_compatresources_dll;
 	BOOLEAN has_panther_unattend;
 	BOOLEAN has_kolibrios;
@@ -500,12 +524,6 @@ typedef struct {
 	uint32_t* address;	// 32-bit will do, as we're not dealing with >4GB DLLs...
 } dll_resolver_t;
 
-/* SBAT entry */
-typedef struct {
-	char* product;
-	uint32_t version;
-} sbat_entry_t;
-
 /* Alignment macro */
 #if defined(__GNUC__)
 #define ALIGNED(m) __attribute__ ((__aligned__(m)))
@@ -556,6 +574,18 @@ typedef void hash_final_t(HASH_CONTEXT* ctx);
 extern hash_init_t* hash_init[HASH_MAX];
 extern hash_write_t* hash_write[HASH_MAX];
 extern hash_final_t* hash_final[HASH_MAX];
+
+/* SBAT entry */
+typedef struct {
+	char* product;
+	uint32_t version;
+} sbat_entry_t;
+
+/* Certificate thumbprint list */
+typedef struct {
+	uint32_t count;
+	uint8_t list[0][SHA1_HASHSIZE];
+} thumbprint_list_t;
 
 #ifndef __VA_GROUP__
 #define __VA_GROUP__(...)  __VA_ARGS__
@@ -652,7 +682,7 @@ typedef struct {
 #define UNATTEND_FORCE_S_MODE               0x00100
 #define UNATTEND_USE_MS2023_BOOTLOADERS     0x00200
 #define UNATTEND_FULL_MASK                  0x003FF
-#define UNATTEND_DEFAULT_MASK               0x000FF
+#define UNATTEND_DEFAULT_MASK               0x002FF		// Mask of values that are persisted
 #define UNATTEND_WINDOWS_TO_GO              0x10000		// Special flag for Windows To Go
 
 #define UNATTEND_WINPE_SETUP_MASK           (UNATTEND_SECUREBOOT_TPM_MINRAM)
@@ -690,8 +720,10 @@ typedef struct {
 	uint32_t Index;		// Current array size
 	uint32_t Max;		// Maximum array size
 } StrArray;
+#define STRARRAY_EMPTY { NULL, 0, 0 };
 extern void StrArrayCreate(StrArray* arr, uint32_t initial_size);
 extern int32_t StrArrayAdd(StrArray* arr, const char* str, BOOL);
+extern int32_t StrArrayAddUnique(StrArray* arr, const char* str, BOOL);
 extern int32_t StrArrayFind(StrArray* arr, const char* str);
 extern void StrArrayClear(StrArray* arr);
 extern void StrArrayDestroy(StrArray* arr);
@@ -720,6 +752,7 @@ extern const int nb_steps[FS_MAX];
 extern float fScale;
 extern windows_version_t WindowsVersion;
 extern sbat_entry_t* sbat_entries;
+extern thumbprint_list_t *sb_active_certs, *sb_revoked_certs;
 extern int dialog_showing, force_update, fs_type, boot_type, partition_type, target_type;
 extern unsigned long syslinux_ldlinux_len[2];
 extern char ubuffer[UBUFFER_SIZE], embedded_sl_version_str[2][12];
@@ -742,6 +775,7 @@ extern void PrintStatusInfo(BOOL info, BOOL debug, unsigned int duration, int ms
 extern void UpdateProgress(int op, float percent);
 extern void _UpdateProgressWithInfo(int op, int msg, uint64_t processed, uint64_t total, BOOL force);
 #define UpdateProgressWithInfo(op, msg, processed, total) _UpdateProgressWithInfo(op, msg, processed, total, FALSE)
+#define UpdateProgressWithInfoUpTo(upto, op, msg, processed, total) _UpdateProgressWithInfo(op, msg, (processed) * (upto), (total) * 100, FALSE)
 #define UpdateProgressWithInfoForce(op, msg, processed, total) _UpdateProgressWithInfo(op, msg, processed, total, TRUE)
 #define UpdateProgressWithInfoInit(hProgressDialog, bNoAltMode) UpdateProgressWithInfo(OP_INIT, (int)bNoAltMode, (uint64_t)(uintptr_t)hProgressDialog, 0);
 extern const char* StrError(DWORD error_code, BOOL use_default_locale);
@@ -754,8 +788,9 @@ extern INT_PTR MyDialogBox(HINSTANCE hInstance, int Dialog_ID, HWND hWndParent, 
 extern void CenterDialog(HWND hDlg, HWND hParent);
 extern void ResizeMoveCtrl(HWND hDlg, HWND hCtrl, int dx, int dy, int dw, int dh, float scale);
 extern void ResizeButtonHeight(HWND hDlg, int id);
-extern void CreateStatusBar(void);
+extern void CreateStatusBar(HFONT* hFont);
 extern void CreateStaticFont(HDC hDC, HFONT* hFont, BOOL underlined);
+extern void SetHyperLinkFont(HWND hWnd, HDC hDC, HFONT* hFont, BOOL underlined);
 extern void SetTitleBarIcon(HWND hDlg);
 extern BOOL CreateTaskbarList(void);
 extern BOOL SetTaskbarProgressState(TASKBAR_PROGRESS_FLAGS tbpFlags);
@@ -764,7 +799,8 @@ extern INT_PTR CreateAboutBox(void);
 extern BOOL CreateTooltip(HWND hControl, const char* message, int duration);
 extern void DestroyTooltip(HWND hWnd);
 extern void DestroyAllTooltips(void);
-extern BOOL Notification(int type, const char* dont_display_setting, const notification_info* more_info, char* title, char* format, ...);
+extern int NotificationEx(int type, const char* dont_display_setting, const notification_info* more_info, const char* title, const char* format, ...);
+#define Notification(type, title, ...) NotificationEx(type, NULL, NULL, title, __VA_ARGS__)
 extern int CustomSelectionDialog(int style, char* title, char* message, char** choices, int size, int mask, int username_index);
 #define SelectionDialog(title, message, choices, size) CustomSelectionDialog(BS_AUTORADIOBUTTON, title, message, choices, size, 1, -1)
 extern void ListDialog(char* title, char* message, char** items, int size);
@@ -785,8 +821,8 @@ extern char* FileDialog(BOOL save, char* path, const ext_t* ext, UINT* selected_
 extern BOOL FileIO(enum file_io_type io_type, char* path, char** buffer, DWORD* size);
 extern uint8_t* GetResource(HMODULE module, char* name, char* type, const char* desc, DWORD* len, BOOL duplicate);
 extern DWORD GetResourceSize(HMODULE module, char* name, char* type, const char* desc);
-extern DWORD RunCommandWithProgress(const char* cmdline, const char* dir, BOOL log, int msg);
-#define RunCommand(cmd, dir, log) RunCommandWithProgress(cmd, dir, log, 0)
+extern DWORD RunCommandWithProgress(const char* cmdline, const char* dir, BOOL log, int msg, const char* pattern);
+#define RunCommand(cmd, dir, log) RunCommandWithProgress(cmd, dir, log, 0, NULL)
 extern BOOL CompareGUID(const GUID *guid1, const GUID *guid2);
 extern BOOL MountRegistryHive(const HKEY key, const char* pszHiveName, const char* pszHivePath);
 extern BOOL UnmountRegistryHive(const HKEY key, const char* pszHiveName);
@@ -815,12 +851,13 @@ extern char* get_token_data_buffer(const char* token, unsigned int n, const char
 extern char* insert_section_data(const char* filename, const char* section, const char* data, BOOL dos2unix);
 extern char* replace_in_token_data(const char* filename, const char* token, const char* src, const char* rep, BOOL dos2unix);
 extern char* replace_char(const char* src, const char c, const char* rep);
+extern void filter_chars(char* str, const char* rem, const char rep);
 extern char* remove_substr(const char* src, const char* sub);
 extern void parse_update(char* buf, size_t len);
 extern void* get_data_from_asn1(const uint8_t* buf, size_t buf_len, const char* oid_str, uint8_t asn1_type, size_t* data_len);
 extern int sanitize_label(char* label);
 extern int IsHDD(DWORD DriveIndex, uint16_t vid, uint16_t pid, const char* strid);
-extern char* GetSignatureName(const char* path, const char* country_code, BOOL bSilent);
+extern char* GetSignatureName(const char* path, const char* country_code, uint8_t* thumbprint, BOOL bSilent);
 extern int GetIssuerCertificateInfo(uint8_t* cert, cert_info_t* info);
 extern uint64_t GetSignatureTimeStamp(const char* path);
 extern LONG ValidateSignature(HWND hDlg, const char* path);
@@ -842,7 +879,6 @@ extern BOOL HashBuffer(const unsigned type, const uint8_t* buf, const size_t len
 extern BOOL IsFileInDB(const char* path);
 extern BOOL IsSignedBySecureBootAuthority(uint8_t* buf, uint32_t len);
 extern int IsBootloaderRevoked(uint8_t* buf, uint32_t len);
-extern void PrintRevokedBootloaderInfo(void);
 extern BOOL IsBufferInDB(const unsigned char* buf, const size_t len);
 #define printbits(x) _printbits(sizeof(x), &x, 0)
 #define printbitslz(x) _printbits(sizeof(x), &x, 1)
@@ -865,6 +901,7 @@ extern HANDLE CreatePreallocatedFile(const char* lpFileName, DWORD dwDesiredAcce
 	DWORD dwFlagsAndAttributes, LONGLONG fileSize);
 extern uint32_t ResolveDllAddress(dll_resolver_t* resolver);
 extern sbat_entry_t* GetSbatEntries(char* sbatlevel);
+extern thumbprint_list_t* GetThumbprintEntries(char* thumbprints_txt);
 extern uint16_t GetPeArch(uint8_t* buf);
 extern uint8_t* GetPeSection(uint8_t* buf, const char* name, uint32_t* len);
 extern uint8_t* GetPeSignatureData(uint8_t* buf);
@@ -872,6 +909,7 @@ extern uint8_t* RvaToPhysical(uint8_t* buf, uint32_t rva);
 extern uint32_t FindResourceRva(const wchar_t* name, uint8_t* root, uint8_t* dir, uint32_t* len);
 extern DWORD ListDirectoryContent(StrArray* arr, char* dir, uint8_t type);
 extern BOOL TakeOwnership(LPCSTR lpszOwnFile);
+extern enum ArchType MachineToArch(WORD machine);
 #define GetTextWidth(hDlg, id) GetTextSize(GetDlgItem(hDlg, id), NULL).cx
 
 DWORD WINAPI HashThread(void* param);
@@ -924,8 +962,13 @@ out:
 #define PF_TYPE_DECL(api, ret, proc, args)	PF_TYPE(api, ret, proc, args); PF_DECL(proc)
 #define PF_INIT(proc, name)					if (pf##proc == NULL) pf##proc = \
 	(proc##_t) GetProcAddress(GetLibraryHandle(#name), #proc)
+#define PF_INIT_ID(proc, name, id)			if (pf##proc == NULL) pf##proc = \
+	(proc##_t) GetProcAddress(GetLibraryHandle(#name), MAKEINTRESOURCEA(id))
 #define PF_INIT_OR_OUT(proc, name)			do {PF_INIT(proc, name);         \
 	if (pf##proc == NULL) {uprintf("Unable to locate %s() in '%s.dll': %s",  \
+	#proc, #name, WindowsErrorString()); goto out;} } while(0)
+#define PF_INIT_ID_OR_OUT(proc, name, id)	do {PF_INIT_ID(proc, name, id);  \
+	if (pf##proc == NULL) {uprintf("Unable to locate %s() in %s.dll: %s\n",  \
 	#proc, #name, WindowsErrorString()); goto out;} } while(0)
 #define PF_INIT_OR_SET_STATUS(proc, name)	do {PF_INIT(proc, name);         \
 	if ((pf##proc == NULL) && (NT_SUCCESS(status))) status = STATUS_PROCEDURE_NOT_FOUND; } while(0)

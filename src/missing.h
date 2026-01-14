@@ -1,7 +1,7 @@
 /*
 * Rufus: The Reliable USB Formatting Utility
 * Constants and defines missing from various toolchains
-* Copyright © 2016-2024 Pete Batard <pete@akeo.ie>
+* Copyright © 2016-2025 Pete Batard <pete@akeo.ie>
 *
 * This program is free software: you can redistribute it and/or modify
 * it under the terms of the GNU General Public License as published by
@@ -30,10 +30,14 @@
 #define MAX(a,b) (((a) > (b)) ? (a) : (b))
 #endif
 
-#define LO_ALIGN_X_TO_Y(x, y) (((x) / (y)) * (y))
-#define HI_ALIGN_X_TO_Y(x, y) ((((x) + (y) - 1) / (y)) * (y))
+#define MAP_BIT(bit) do { map[_log2(bit)] = b; b <<= 1; } while(0)
+
+#define FLOOR_ALIGN(x, y) (((x) / (y)) * (y))
+#define CEILING_ALIGN(x, y) ((((x) + (y) - 1) / (y)) * (y))
 
 #define IS_HEXASCII(c) (((c) >= '0' && (c) <= '9') || ((c) >= 'A' && (c) <= 'F') || ((c) >= 'a' && (c) <= 'f'))
+#define FROM_HEXASCII(c) (((c) >= '0' && (c) <= '9') ? (c) - '0' : (((c) >= 'A' && (c) <= 'Z') ? (c) - 'A' + 10 : \
+	(((c) >= 'a' && (c) <= 'z') ? (c) - 'a' + 10 : 0 )))
 
 /*
  * Prefetch 64 bytes at address m, for read-only operation
@@ -183,7 +187,7 @@ static __inline uint16_t remap16(uint16_t src, uint16_t* map, const BOOL reverse
 #define ERROR_OFFSET_ALIGNMENT_VIOLATION        327
 #endif
 
-/* RISC-V is still bleeding edge */
+/* RISC-V and LoongArch are still bleeding edge */
 #ifndef IMAGE_FILE_MACHINE_RISCV32
 #define IMAGE_FILE_MACHINE_RISCV32 0x5032
 #endif
@@ -192,4 +196,10 @@ static __inline uint16_t remap16(uint16_t src, uint16_t* map, const BOOL reverse
 #endif
 #ifndef IMAGE_FILE_MACHINE_RISCV128
 #define IMAGE_FILE_MACHINE_RISCV128 0x5128
+#endif
+#ifndef IMAGE_FILE_MACHINE_LOONGARCH32
+#define IMAGE_FILE_MACHINE_LOONGARCH32 0x6232
+#endif
+#ifndef IMAGE_FILE_MACHINE_LOONGARCH64
+#define IMAGE_FILE_MACHINE_LOONGARCH64 0x6264
 #endif

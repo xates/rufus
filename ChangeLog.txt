@@ -1,3 +1,52 @@
+o Version 4.11 (2025.10.02)
+    Add a cheat mode to toggle between Light and Dark mode
+    Improve WUE option text relating to the CA 2023 option
+    Update Linux SBAT / Microsoft SVN Secure Boot revocation values to latest
+    Fix some GRUB/Syslinux download dialogs showing only the 'Close' button
+    Fix an assert being triggered when using the WUE CA 2023 option on its own
+    Fix an application crash on systems that have a failed dynamic disk
+
+o Version 4.10 (2025.09.24)
+    Add Dark Mode support (courtesy of @ozone10)
+    Add support for creating Windows CA 2023 compatible media (requires a Windows 11 25H2 ISO)
+    Add support for saving an existing drive to ISO (UDF only)
+    Improve error reporting when saving to VHD/VHDX (with thanks to @Kazkans)
+    Improve persistence support for Linux Mint
+    Fix UEFI DBX updates being reported in some timezones, even when there are none
+    Fix a situation where no file system can be selected in ISO mode
+    Fix a crash when trying to process Windows ISOs with very long paths
+
+o Version 4.9 (2025.06.15) [BUGFIX RELEASE]
+    Fix downloads from https://rufus.ie no longer working due to recent GitHub server changes
+    Fix unofficial Windows ISOs, with single index WIMs, not presenting the WUE dialog
+
+o Version 4.8 (2025.06.11)
+    Switch to wimlib for all WIM image processing:
+      - Greatly speeds up image analysis when opening Windows ISOs
+      - Can speed up Windows To Go drive creation (But won't do miracles if you have a crap drive)
+      - Might help with Parallels limitations on Mac (But Rufus on Parallels is still UNSUPPORTED)
+      - Enables the splitting of >4GB files with Alt-E (But still WAY SLOWER than using UEFI:NTFS)
+    Switch to using Visual Studio binaries everywhere, due to MinGW DLL delay-loading limitations
+    Add more exceptions for Linux ISOs that restrict themselves to DD mode (Nobara, openSUSE, ...)
+    Improve reporting of UEFI bootloaders in the log, with info on the Secure Boot status
+    Fix an issue with size limitations when writing an uncompressed VHD back to the same drive
+    Fix a crash when opening the log with the 32-bit MinGW compiled version
+    Fix commandline parameters not being forwarded to original Windows setup.exe
+
+o Version 4.7 (2025.04.09)
+    Add a mechanism to detect and download updated DBXs from the official UEFI repository
+    Add zstd compression support for disk images
+    Add a new exclusion feature in the settings, to ignore disks with a specific GPT GUID
+    Improve detection for compressed VHD images that are too large to fit the target drive
+    Fix commandline hogger not being deleted when running Rufus from a different directory
+    Fix FAT filenames from embedded images being potentially truncated on image extraction
+    Fix a side-loading vulnerability [CVE-2025-26624] with cfgmgr32.dll (with thanks to @EmperialX)
+    Fix UI memory leaks (courtesy of @ozone10)
+    Fall back to user/system default locale when getting error description (courtesy of @Wack0)
+    Don't run the commandline hogger on POSIX shells
+    Drop ARM 32-bit builds (Note that ARM 64-bit builds are *NOT* affected by this)
+    Update FreeDOS and Grub4DOS to latest
+
 o Version 4.6 (2024.10.21)
     Add a new setup.exe wrapper to bypass Windows 11 24H2 in-place upgrade restrictions
     Add TimeZone to regional options replication

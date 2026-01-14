@@ -36,6 +36,7 @@
 #include "drive.h"
 #include "missing.h"
 #include "resource.h"
+#include "darkmode.h"
 #include "msapi_utf8.h"
 #include "localization.h"
 
@@ -555,27 +556,30 @@ void AdjustForLowDPI(HWND hDlg)
 	InvalidateRect(hDlg, NULL, TRUE);
 }
 
-void SetSectionHeaders(HWND hDlg)
+void SetSectionHeaders(HWND hDlg, HFONT* hFont)
 {
 	RECT rc;
 	HWND hCtrl;
 	SIZE sz;
-	HFONT hf;
 	wchar_t wtmp[128];
 	size_t wlen;
 	int i;
 
 	// Set the section header fonts and resize the static controls accordingly
-	hf = CreateFontA(-MulDiv(14, GetDeviceCaps(GetDC(hMainDialog), LOGPIXELSY), 72), 0, 0, 0,
-		FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, PROOF_QUALITY, 0, "Segoe UI");
+	if (*hFont == NULL) {
+		HDC hDC = GetDC(hMainDialog);
+		*hFont = CreateFontA(-MulDiv(14, GetDeviceCaps(hDC, LOGPIXELSY), 72), 0, 0, 0,
+			FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, PROOF_QUALITY, 0, "Segoe UI");
+		safe_release_dc(hMainDialog, hDC);
+	}
 
 	for (i = 0; i < ARRAYSIZE(section_control_ids); i++) {
-		SendDlgItemMessageA(hDlg, section_control_ids[i], WM_SETFONT, (WPARAM)hf, TRUE);
+		SendDlgItemMessageA(hDlg, section_control_ids[i], WM_SETFONT, (WPARAM)*hFont, TRUE);
 		hCtrl = GetDlgItem(hDlg, section_control_ids[i]);
 		memset(wtmp, 0, sizeof(wtmp));
 		GetWindowTextW(hCtrl, wtmp, ARRAYSIZE(wtmp) - 4);
 		wlen = wcslen(wtmp);
-		if_not_assert(wlen < ARRAYSIZE(wtmp) - 2)
+		if_assert_fails(wlen < ARRAYSIZE(wtmp) - 2)
 			break;
 		wtmp[wlen++] = L' ';
 		wtmp[wlen++] = L' ';
@@ -837,7 +841,7 @@ void ToggleImageOptions(void)
 // We need to create the small toolbar buttons first so that we can compute their width
 void CreateSmallButtons(HWND hDlg)
 {
-	HIMAGELIST hImageList;
+	HIMAGELIST hSaveImageList, hHashImageList;
 	HICON hIconSave, hIconHash;
 	int icon_offset = 0, i16 = GetSystemMetrics(SM_CXSMICON);
 	TBBUTTON tbToolbarButtons[1];
@@ -851,12 +855,13 @@ void CreateSmallButtons(HWND hDlg)
 
 	hSaveToolbar = CreateWindowEx(0, TOOLBARCLASSNAME, NULL, TOOLBAR_STYLE,
 		0, 0, 0, 0, hMainDialog, (HMENU)IDC_SAVE_TOOLBAR, hMainInstance, NULL);
-	hImageList = ImageList_Create(i16, i16, ILC_COLOR32 | ILC_HIGHQUALITYSCALE | ILC_MIRROR, 1, 0);
+	hSaveImageList = ImageList_Create(i16, i16, ILC_COLOR32 | ILC_HIGHQUALITYSCALE | ILC_MIRROR, 1, 0);
 	buffer = GetResource(hMainInstance, MAKEINTRESOURCEA(IDI_SAVE_16 + icon_offset), _RT_RCDATA, "save icon", &bufsize, FALSE);
 	hIconSave = CreateIconFromResourceEx(buffer, bufsize, TRUE, 0x30000, 0, 0, 0);
-	ImageList_AddIcon(hImageList, hIconSave);
+	ChangeIconColor(&hIconSave, 0);
+	ImageList_AddIcon(hSaveImageList, hIconSave);
 	DestroyIcon(hIconSave);
-	SendMessage(hSaveToolbar, TB_SETIMAGELIST, (WPARAM)0, (LPARAM)hImageList);
+	SendMessage(hSaveToolbar, TB_SETIMAGELIST, (WPARAM)0, (LPARAM)hSaveImageList);
 	SendMessage(hSaveToolbar, TB_BUTTONSTRUCTSIZE, (WPARAM)sizeof(TBBUTTON), 0);
 	memset(tbToolbarButtons, 0, sizeof(TBBUTTON));
 	tbToolbarButtons[0].idCommand = IDC_SAVE;
@@ -868,12 +873,13 @@ void CreateSmallButtons(HWND hDlg)
 
 	hHashToolbar = CreateWindowEx(0, TOOLBARCLASSNAME, NULL, TOOLBAR_STYLE,
 		0, 0, 0, 0, hMainDialog, (HMENU)IDC_HASH_TOOLBAR, hMainInstance, NULL);
-	hImageList = ImageList_Create(i16, i16, ILC_COLOR32 | ILC_HIGHQUALITYSCALE | ILC_MIRROR, 1, 0);
+	hHashImageList = ImageList_Create(i16, i16, ILC_COLOR32 | ILC_HIGHQUALITYSCALE | ILC_MIRROR, 1, 0);
 	buffer = GetResource(hMainInstance, MAKEINTRESOURCEA(IDI_HASH_16 + icon_offset), _RT_RCDATA, "hash icon", &bufsize, FALSE);
 	hIconHash = CreateIconFromResourceEx(buffer, bufsize, TRUE, 0x30000, 0, 0, 0);
-	ImageList_AddIcon(hImageList, hIconHash);
+	ChangeIconColor(&hIconHash, 0);
+	ImageList_AddIcon(hHashImageList, hIconHash);
 	DestroyIcon(hIconHash);
-	SendMessage(hHashToolbar, TB_SETIMAGELIST, (WPARAM)0, (LPARAM)hImageList);
+	SendMessage(hHashToolbar, TB_SETIMAGELIST, (WPARAM)0, (LPARAM)hHashImageList);
 	SendMessage(hHashToolbar, TB_BUTTONSTRUCTSIZE, (WPARAM)sizeof(TBBUTTON), 0);
 	memset(tbToolbarButtons, 0, sizeof(TBBUTTON));
 	tbToolbarButtons[0].idCommand = IDC_HASH;
@@ -887,11 +893,15 @@ void CreateSmallButtons(HWND hDlg)
 static INT_PTR CALLBACK ProgressCallback(HWND hCtrl, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	HDC hDC;
+	HPEN hOldPen;
+	HFONT hOldFont;
+	HBRUSH hOldBrush;
 	RECT rc, rc2;
 	PAINTSTRUCT ps;
 	SIZE size;
 	LONG full_right;
 	wchar_t winfo[128];
+	COLORREF background_color, text_color, inverted_text_color, border_color;
 	static BOOL marquee_mode = FALSE;
 	static uint32_t pos = 0, min = 0, max = 0xFFFF;
 	static COLORREF color = PROGRESS_BAR_NORMAL_COLOR;
@@ -954,14 +964,18 @@ static INT_PTR CALLBACK ProgressCallback(HWND hCtrl, UINT message, WPARAM wParam
 
 	case WM_PAINT:
 		hDC = BeginPaint(hCtrl, &ps);
+		background_color = is_darkmode_enabled ? DARKMODE_NORMAL_CONTROL_BACKGROUND_COLOR : PROGRESS_BAR_BACKGROUND_COLOR;
+		text_color = is_darkmode_enabled ? PROGRESS_BAR_INVERTED_TEXT_COLOR : PROGRESS_BAR_NORMAL_TEXT_COLOR;
+		inverted_text_color = is_darkmode_enabled ? PROGRESS_BAR_NORMAL_TEXT_COLOR : PROGRESS_BAR_INVERTED_TEXT_COLOR;
+		border_color = is_darkmode_enabled ? DARKMODE_NORMAL_CONTROL_EDGE_COLOR : PROGRESS_BAR_BOX_COLOR;
 		GetClientRect(hCtrl, &rc);
 		rc2 = rc;
 		InflateRect(&rc, -1, -1);
-		SelectObject(hDC, GetStockObject(DC_PEN));
-		SelectObject(hDC, GetStockObject(NULL_BRUSH));
+		hOldPen = (HPEN)SelectObject(hDC, GetStockObject(DC_PEN));
+		hOldBrush = (HBRUSH)SelectObject(hDC, GetStockObject(NULL_BRUSH));
 		// TODO: Handle SetText message so we can avoid this call
 		GetWindowTextW(hProgress, winfo, ARRAYSIZE(winfo));
-		SelectObject(hDC, hInfoFont);
+		hOldFont = (hInfoFont != NULL) ? (HFONT)SelectObject(hDC, hInfoFont) : NULL;
 		GetTextExtentPoint32(hDC, winfo, (int)wcslen(winfo), &size);
 		if (size.cx > rc.right)
 			size.cx = rc.right;
@@ -972,7 +986,7 @@ static INT_PTR CALLBACK ProgressCallback(HWND hCtrl, UINT message, WPARAM wParam
 			// Optional first segment
 			if (pos + ((max - min) / 5) > max) {
 				rc.right = MulDiv(pos + ((max - min) / 5) - max, rc.right, max - min);
-				SetTextColor(hDC, PROGRESS_BAR_INVERTED_TEXT_COLOR);
+				SetTextColor(hDC, inverted_text_color);
 				SetBkColor(hDC, color);
 				ExtTextOut(hDC, (full_right - size.cx) / 2, (rc.bottom - size.cy) / 2,
 					ETO_CLIPPED | ETO_OPAQUE | ETO_NUMERICSLOCAL, &rc, winfo, (int)wcslen(winfo), NULL);
@@ -982,8 +996,8 @@ static INT_PTR CALLBACK ProgressCallback(HWND hCtrl, UINT message, WPARAM wParam
 			// Optional second segment
 			if (pos > min) {
 				rc.right = MulDiv(pos - min, rc.right, max - min);
-				SetTextColor(hDC, PROGRESS_BAR_NORMAL_TEXT_COLOR);
-				SetBkColor(hDC, PROGRESS_BAR_BACKGROUND_COLOR);
+				SetTextColor(hDC, text_color);
+				SetBkColor(hDC, background_color);
 				ExtTextOut(hDC, (full_right - size.cx) / 2, (rc.bottom - size.cy) / 2,
 					ETO_CLIPPED | ETO_OPAQUE | ETO_NUMERICSLOCAL, &rc, winfo, (int)wcslen(winfo), NULL);
 				rc.left = rc.right;
@@ -991,14 +1005,14 @@ static INT_PTR CALLBACK ProgressCallback(HWND hCtrl, UINT message, WPARAM wParam
 			}
 			// Second to last segment
 			rc.right = MulDiv(pos - min + ((max - min) / 5), rc.right, max - min);
-			SetTextColor(hDC, PROGRESS_BAR_INVERTED_TEXT_COLOR);
+			SetTextColor(hDC, inverted_text_color);
 			SetBkColor(hDC, color);
 			ExtTextOut(hDC, (full_right - size.cx) / 2, (rc.bottom - size.cy) / 2,
 				ETO_CLIPPED | ETO_OPAQUE | ETO_NUMERICSLOCAL, &rc, winfo, (int)wcslen(winfo), NULL);
 		} else {
 			// First segment
 			rc.right = (pos > min) ? MulDiv(pos - min, rc.right, max - min) : rc.left;
-			SetTextColor(hDC, PROGRESS_BAR_INVERTED_TEXT_COLOR);
+			SetTextColor(hDC, inverted_text_color);
 			SetBkColor(hDC, color);
 			ExtTextOut(hDC, (full_right - size.cx) / 2, (rc.bottom - size.cy) / 2,
 				ETO_CLIPPED | ETO_OPAQUE | ETO_NUMERICSLOCAL, &rc, winfo, (int)wcslen(winfo), NULL);
@@ -1006,13 +1020,17 @@ static INT_PTR CALLBACK ProgressCallback(HWND hCtrl, UINT message, WPARAM wParam
 		// Last segment
 		rc.left = rc.right;
 		rc.right = full_right;
-		SetTextColor(hDC, PROGRESS_BAR_NORMAL_TEXT_COLOR);
-		SetBkColor(hDC, PROGRESS_BAR_BACKGROUND_COLOR);
+		SetTextColor(hDC, text_color);
+		SetBkColor(hDC, background_color);
 		ExtTextOut(hDC, (full_right - size.cx) / 2, (rc.bottom - size.cy) / 2,
 			ETO_CLIPPED | ETO_OPAQUE | ETO_NUMERICSLOCAL, &rc, winfo, (int)wcslen(winfo), NULL);
 		// Bounding rectangle
-		SetDCPenColor(hDC, PROGRESS_BAR_BOX_COLOR);
+		SetDCPenColor(hDC, border_color);
 		Rectangle(hDC, rc2.left, rc2.top, rc2.right, rc2.bottom);
+		if (hOldFont != NULL)
+			SelectObject(hDC, hOldFont);
+		SelectObject(hDC, hOldPen);
+		SelectObject(hDC, hOldBrush);
 		EndPaint(hCtrl, &ps);
 		return (INT_PTR)TRUE;
 	}
@@ -1051,8 +1069,8 @@ void CreateAdditionalControls(HWND hDlg)
 
 	// Fetch the up and down expand icons for the advanced options toolbar
 	hDll = GetLibraryHandle("ComDlg32");
-	hIconDown = (HICON)LoadImage(hDll, MAKEINTRESOURCE(577), IMAGE_ICON, s16, s16, LR_DEFAULTCOLOR | LR_SHARED);
-	hIconUp = (HICON)LoadImage(hDll, MAKEINTRESOURCE(578), IMAGE_ICON, s16, s16, LR_DEFAULTCOLOR | LR_SHARED);
+	hIconDown = (HICON)LoadImage(hDll, MAKEINTRESOURCE(is_darkmode_enabled ? 579 : 577), IMAGE_ICON, s16, s16, LR_DEFAULTCOLOR | LR_SHARED);
+	hIconUp = (HICON)LoadImage(hDll, MAKEINTRESOURCE(is_darkmode_enabled ? 580 : 578), IMAGE_ICON, s16, s16, LR_DEFAULTCOLOR | LR_SHARED);
 	// Fallback to using Shell32 if we can't locate the icons we want in ComDlg32 (Windows 8)
 	hDll = GetLibraryHandle("Shell32");
 	if (hIconUp == NULL)
@@ -1112,6 +1130,7 @@ void CreateAdditionalControls(HWND hDlg)
 		buffer = GetResource(hMainInstance, MAKEINTRESOURCEA(multitoolbar_icons[i] + icon_offset),
 			_RT_RCDATA, "toolbar icon", &bufsize, FALSE);
 		hIcon = CreateIconFromResourceEx(buffer, bufsize, TRUE, 0x30000, 0, 0, 0);
+		ChangeIconColor(&hIcon, 0);
 		// Mirror the "world" icon on RTL since we can't use an ImageList mirroring flag for that...
 		if (right_to_left_mode && (i == 0))
 			hIcon = CreateMirroredIcon(hIcon);
@@ -1586,10 +1605,13 @@ void SetBootTypeDropdownWidth(void)
 void OnPaint(HDC hdc)
 {
 	int i;
-	HPEN hp = CreatePen(0, (fScale < 1.5f) ? 2 : 3, RGB(0, 0, 0));
-	SelectObject(hdc, hp);
+	COLORREF cp = is_darkmode_enabled ? DARKMODE_NORMAL_CONTROL_EDGE_COLOR : GetSysColor(COLOR_WINDOWTEXT);
+	HPEN hp = CreatePen(0, (fScale < 1.5f) ? 2 : 3, cp);
+	HPEN hop = (HPEN)SelectObject(hdc, hp);
 	for (i = 0; i < ARRAYSIZE(section_vpos); i++) {
 		MoveToEx(hdc, mw + 10, section_vpos[i], NULL);
 		LineTo(hdc, mw + fw, section_vpos[i]);
 	}
+	SelectObject(hdc, hop);
+	DeleteObject(hp);
 }
